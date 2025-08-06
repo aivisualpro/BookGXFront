@@ -141,7 +141,7 @@ export class Logger {
 }
 
 // Backend health check with caching
-export async function checkBackendHealth(baseUrl: string = 'http://localhost:3001'): Promise<boolean> {
+export async function checkBackendHealth(baseUrl: string = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001'): Promise<boolean> {
   const cacheKey = 'backend_health';
   
   // Check cache first (5 minute TTL)

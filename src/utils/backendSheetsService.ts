@@ -3,7 +3,7 @@
 
 import { checkBackendHealth, Logger } from './optimizations';
 
-const BACKEND_URL = 'http://localhost:3001';
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001';
 
 export interface BackendResponse<T> {
   success: boolean;
