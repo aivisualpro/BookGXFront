@@ -53,6 +53,7 @@ export function ConnectionsManager({ setCurrentView, setSelectedConnection, acti
 
   // Modal states
   const [showAddConnection, setShowAddConnection] = useState(false);
+  const [isTesting, setIsTesting] = useState(false);
 
   // Form states
   const [newConnectionName, setNewConnectionName] = useState('');
@@ -104,68 +105,105 @@ export function ConnectionsManager({ setCurrentView, setSelectedConnection, acti
     if (!newConnectionName.trim() || !newProjectId.trim() || !newApiKey.trim()) return;
 
     const currentConnections = getCurrentConnections();
+    
+    // Generate meaningful ID based on region and connection name
+    const sanitizedName = newConnectionName.trim().replace(/[^a-zA-Z0-9]/g, '_');
+    const connectionId = editingConnectionId || `${activeTab === 'saudi' ? 'Saudi' : 'Egypt'}_${sanitizedName}`;
+
+    setIsTesting(true);
 
     try {
+      // Create connection object for testing
+      const connectionToTest = {
+        id: connectionId,
+        name: newConnectionName.trim(),
+        projectId: newProjectId.trim(),
+        apiKey: newApiKey.trim(),
+        privateKey: newPrivateKey.trim(),
+        clientEmail: newClientEmail.trim(),
+        clientId: newClientId.trim(),
+        status: 'testing' as const,
+        createdAt: editingConnectionId ? 
+          currentConnections.find(c => c.id === editingConnectionId)?.createdAt || new Date() : 
+          new Date()
+      };
+
+      // Update UI to show testing state
       if (editingConnectionId) {
-        // Edit existing connection
-        const updatedConnection = {
-          id: editingConnectionId,
-          name: newConnectionName.trim(),
-          projectId: newProjectId.trim(),
-          apiKey: newApiKey.trim(),
-          privateKey: newPrivateKey.trim(),
-          clientEmail: newClientEmail.trim(),
-          clientId: newClientId.trim(),
-          status: 'disconnected' as const,
-          createdAt: currentConnections.find(c => c.id === editingConnectionId)?.createdAt || new Date()
-        };
+        const testingConnections = currentConnections.map(conn => 
+          conn.id === editingConnectionId ? connectionToTest : conn
+        );
+        setCurrentConnections(testingConnections);
+      } else {
+        setCurrentConnections([...currentConnections, connectionToTest]);
+      }
 
-        // Save to Firebase
-        await saveConnection(updatedConnection, activeTab);
+      // Test the connection first
+      const testResult = await testConnectionBeforeSave(connectionToTest);
+      
+      if (!testResult.success) {
+        // Remove from UI or update with error status
+        if (editingConnectionId) {
+          const errorConnections = currentConnections.map(conn => 
+            conn.id === editingConnectionId ? 
+            { ...connectionToTest, status: 'error' as const, errorMessage: testResult.error } : 
+            conn
+          );
+          setCurrentConnections(errorConnections);
+        } else {
+          // Remove the failed connection from the list
+          setCurrentConnections(currentConnections);
+        }
+        
+        // Show error to user
+        alert(`Connection test failed: ${testResult.error}\n\nPlease fix the connection details before saving.`);
+        return;
+      }
 
-        // Update local state
+      // If test successful, save to Firebase
+      const finalConnection = {
+        ...connectionToTest,
+        status: 'connected' as const,
+        lastTested: new Date(),
+        errorMessage: undefined
+      };
+
+      // Save to Firebase
+      await saveConnection(finalConnection, activeTab);
+
+      // Update local state with successful connection
+      if (editingConnectionId) {
         const updatedConnections = currentConnections.map(conn => 
-          conn.id === editingConnectionId ? updatedConnection : conn
+          conn.id === editingConnectionId ? finalConnection : conn
         );
         setCurrentConnections(updatedConnections);
-
-        console.log('✅ Connection updated successfully');
       } else {
-        // Add new connection
-        const newConnection: GoogleConnection = {
-          id: generateId(),
-          name: newConnectionName.trim(),
-          projectId: newProjectId.trim(),
-          apiKey: newApiKey.trim(),
-          privateKey: newPrivateKey.trim(),
-          clientEmail: newClientEmail.trim(),
-          clientId: newClientId.trim(),
-          status: 'disconnected',
-          createdAt: new Date()
-        };
-
-        // Save to Firebase
-        await saveConnection(newConnection, activeTab);
-
-        // Update local state
-        setCurrentConnections([...currentConnections, newConnection]);
-
-        console.log('✅ Connection added successfully');
+        const updatedConnections = currentConnections.filter(conn => conn.id !== connectionId);
+        setCurrentConnections([...updatedConnections, finalConnection]);
       }
+
+      // Reset form only after successful save
+      setNewConnectionName('');
+      setNewProjectId('');
+      setNewApiKey('');
+      setNewPrivateKey('');
+      setNewClientEmail('');
+      setNewClientId('');
+      setEditingConnectionId(null);
+      setShowAddConnection(false);
+
     } catch (error) {
       console.error('❌ Failed to save connection:', error);
-      // You might want to show an error message to the user here
+      
+      // Remove failed connection from UI if it was a new one
+      if (!editingConnectionId) {
+        setCurrentConnections(currentConnections);
+      }
+      
+      alert(`Failed to save connection: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    } finally {
+      setIsTesting(false);
     }
-    
-    // Reset form
-    setNewConnectionName('');
-    setNewProjectId('');
-    setNewApiKey('');
-    setNewPrivateKey('');
-    setNewClientEmail('');
-    setNewClientId('');
-    setEditingConnectionId(null);
-    setShowAddConnection(false);
   };
 
   const deleteConnection = async (connectionId: string) => {
@@ -177,10 +215,88 @@ export function ConnectionsManager({ setCurrentView, setSelectedConnection, acti
       const currentConnections = getCurrentConnections();
       setCurrentConnections(currentConnections.filter(conn => conn.id !== connectionId));
 
-      console.log('✅ Connection deleted successfully');
     } catch (error) {
       console.error('❌ Failed to delete connection:', error);
       // You might want to show an error message to the user here
+    }
+  };
+
+  const testConnectionBeforeSave = async (connection: GoogleConnection): Promise<{success: boolean, error?: string}> => {
+    try {
+      // Step 1: Verify API Key and credentials
+      if (!connection.apiKey || connection.apiKey.trim() === '') {
+        return { success: false, error: 'API Key is missing or empty' };
+      }
+      if (!connection.projectId || connection.projectId.trim() === '') {
+        return { success: false, error: 'Project ID is missing or empty' };
+      }
+      
+      // Basic API key format validation
+      const apiKey = connection.apiKey.trim();
+      if (!apiKey.startsWith('AIza') || apiKey.length < 30) {
+        return { success: false, error: 'API Key format appears invalid. Google API keys typically start with "AIza" and are longer than 30 characters.' };
+      }
+      
+      // Step 2: Test API connectivity
+      const publicSpreadsheetId = '1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms';
+      const apiTestUrl = `https://sheets.googleapis.com/v4/spreadsheets/${publicSpreadsheetId}?key=${connection.apiKey}`;
+      
+      let apiResponse;
+      try {
+        apiResponse = await fetch(apiTestUrl, {
+          method: 'GET',
+          headers: {
+            'Accept': 'application/json',
+          },
+          mode: 'cors'
+        });
+      } catch (fetchError) {
+        if (fetchError instanceof TypeError && fetchError.message.includes('Failed to fetch')) {
+          return { success: false, error: 'Network/CORS Error: Cannot verify API connectivity due to browser security restrictions. API key format appears valid.' };
+        }
+        throw fetchError;
+      }
+      
+      // Step 3: Analyze response
+      if (!apiResponse.ok) {
+        const errorData = await apiResponse.json().catch(() => null);
+        
+        let detailedError = '';
+        switch (apiResponse.status) {
+          case 401:
+            detailedError = 'API Key is invalid or expired';
+            break;
+          case 403:
+            if (errorData?.error?.message?.includes('API has not been used')) {
+              detailedError = 'Google Sheets API is not enabled for this project. Enable it in Google Cloud Console.';
+            } else if (errorData?.error?.message?.includes('quota')) {
+              detailedError = 'API quota exceeded. Check your usage limits.';
+            } else {
+              detailedError = 'Permission denied - Check API key permissions.';
+            }
+            break;
+          case 404:
+            detailedError = 'Resource not found - Project ID may be invalid.';
+            break;
+          case 429:
+            detailedError = 'Rate limit exceeded - Try again later.';
+            break;
+          default:
+            detailedError = `API Error: ${apiResponse.status} ${apiResponse.statusText}`;
+        }
+        
+        if (errorData?.error?.message) {
+          detailedError += ` | ${errorData.error.message}`;
+        }
+        
+        return { success: false, error: detailedError };
+      }
+      
+      return { success: true };
+      
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Connection test failed';
+      return { success: false, error: errorMessage };
     }
   };
 
@@ -199,15 +315,7 @@ export function ConnectionsManager({ setCurrentView, setSelectedConnection, acti
     setCurrentConnections(testingConnections);
 
     try {
-      console.log('🧪 COMPREHENSIVE CONNECTION TEST - Starting validation...');
-      console.log('🔗 Connection:', connection.name);
-      console.log('🔑 Project ID:', connection.projectId);
-      console.log('📧 Client Email:', connection.clientEmail);
-      console.log('🆔 Client ID:', connection.clientId);
-      console.log('🔐 API Key:', connection.apiKey?.substring(0, 15) + '...');
-      
-      // Step 1: Verify API Key or Service Account File Exists
-      console.log('📋 Step 1: Verifying API Key and credentials...');
+      // Step 1: Verify API Key and credentials
       if (!connection.apiKey || connection.apiKey.trim() === '') {
         throw new Error('API Key is missing or empty');
       }
@@ -221,15 +329,11 @@ export function ConnectionsManager({ setCurrentView, setSelectedConnection, acti
         throw new Error('API Key format appears invalid. Google API keys typically start with "AIza" and are longer than 30 characters.');
       }
       
-      console.log('✅ Step 1: API Key and Project ID are present and format appears valid');
-
       // Step 2: Validate Google Project Settings & Check if Required APIs are Enabled
-      console.log('📋 Step 2: Validating project settings and API enablement...');
       
       // Use CORS-friendly approach with a valid public spreadsheet
       const publicSpreadsheetId = '1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms';
       const apiTestUrl = `https://sheets.googleapis.com/v4/spreadsheets/${publicSpreadsheetId}?key=${connection.apiKey}`;
-      console.log('🌐 Testing API endpoint with public spreadsheet:', apiTestUrl);
       
       let apiResponse;
       try {
@@ -243,18 +347,15 @@ export function ConnectionsManager({ setCurrentView, setSelectedConnection, acti
       } catch (fetchError) {
         // Handle CORS and network errors specifically
         if (fetchError instanceof TypeError && fetchError.message.includes('Failed to fetch')) {
-          console.log('🔍 Fetch failed, likely due to CORS or network. Trying alternative validation...');
           throw new Error('Network/CORS Error: Direct API validation failed. This is common in browser environments. API key format appears valid, but cannot verify connectivity due to browser security restrictions.');
         }
         throw fetchError;
       }
       
-      console.log('📊 API Response Status:', apiResponse.status);
       
       // Step 3: Analyze response and provide detailed feedback
       if (!apiResponse.ok) {
         const errorData = await apiResponse.json().catch(() => null);
-        console.log('💥 API Error Details:', errorData);
         
         let detailedError = '';
         switch (apiResponse.status) {
@@ -287,7 +388,6 @@ export function ConnectionsManager({ setCurrentView, setSelectedConnection, acti
         throw new Error(detailedError);
       }
       
-      console.log('✅ Step 2: Project settings and API enablement verified');
       
       // Final Success
       const successConnections = currentConnections.map(conn => 
@@ -302,7 +402,6 @@ export function ConnectionsManager({ setCurrentView, setSelectedConnection, acti
       );
       setCurrentConnections(successConnections);
       
-      console.log('🎉 ✅ COMPREHENSIVE TEST PASSED: API is working correctly!');
       
     } catch (error) {
       console.error('❌ COMPREHENSIVE TEST FAILED:', error);
@@ -344,7 +443,6 @@ export function ConnectionsManager({ setCurrentView, setSelectedConnection, acti
         : conn
     );
     setCurrentConnections(updatedConnections);
-    console.log('🔑 API Key updated directly for connection:', connectionId);
   };
 
   // Load/Save configurations with Firebase
@@ -461,36 +559,6 @@ export function ConnectionsManager({ setCurrentView, setSelectedConnection, acti
 
   return (
     <div className="max-w-7xl mx-auto">
-      {/* Header */}
-      <div className="mb-8">
-        <h1 className="text-3xl font-bold text-white mb-2">Connection Management</h1>
-        <p className="text-gray-400">Manage your Google Sheets API connections and data sources</p>
-      </div>
-
-      {/* Country Tabs */}
-      <div className="flex space-x-4 mb-8">
-        <button
-          onClick={() => setActiveTab('saudi')}
-          className={`px-6 py-3 rounded-lg font-medium transition-all duration-200 ${
-            activeTab === 'saudi'
-              ? 'bg-gradient-to-r from-primary to-accent text-white shadow-lg'
-              : 'bg-white/10 text-gray-400 hover:text-white hover:bg-white/20'
-          }`}
-        >
-          🇸🇦 Saudi Arabia
-        </button>
-        <button
-          onClick={() => setActiveTab('egypt')}
-          className={`px-6 py-3 rounded-lg font-medium transition-all duration-200 ${
-            activeTab === 'egypt'
-              ? 'bg-gradient-to-r from-primary to-accent text-white shadow-lg'
-              : 'bg-white/10 text-gray-400 hover:text-white hover:bg-white/20'
-          }`}
-        >
-          🇪🇬 Egypt
-        </button>
-      </div>
-
       {/* Connections Table */}
       <div className="space-y-6">
         <div className="glass rounded-2xl p-6 backdrop-blur-xl border border-white/10">
@@ -534,16 +602,13 @@ export function ConnectionsManager({ setCurrentView, setSelectedConnection, acti
                   {currentConnections.map((connection) => (
                     <tr 
                       key={connection.id} 
-                      className="border-b border-white/10 hover:bg-white/5 transition-colors duration-200"
+                      className="border-b border-white/10 hover:bg-white/5 transition-colors duration-200 cursor-pointer"
+                      onClick={() => {
+                        setSelectedConnection(connection.id);
+                      }}
                     >
                       {/* Connection Name */}
-                      <td 
-                        className="py-4 px-4 cursor-pointer"
-                        onClick={() => {
-                          setSelectedConnection(connection.id);
-                          setCurrentView('databases');
-                        }}
-                      >
+                      <td className="py-4 px-4">
                         <div className="flex items-center space-x-3">
                           <div className="p-2 bg-white/10 rounded-lg">
                             {getStatusIcon(connection.status)}
@@ -707,17 +772,26 @@ export function ConnectionsManager({ setCurrentView, setSelectedConnection, acti
                   setNewPrivateKey('');
                   setNewClientEmail('');
                   setNewClientId('');
+                  setIsTesting(false);
                 }}
-                className="flex-1 bg-gray-600 text-white px-4 py-2 rounded-lg hover:bg-gray-700 transition-colors"
+                disabled={isTesting}
+                className="flex-1 bg-gray-600 text-white px-4 py-2 rounded-lg hover:bg-gray-700 transition-colors disabled:opacity-50"
               >
                 Cancel
               </button>
               <button
                 onClick={addConnection}
-                disabled={!newConnectionName.trim() || !newProjectId.trim() || !newApiKey.trim()}
+                disabled={!newConnectionName.trim() || !newProjectId.trim() || !newApiKey.trim() || isTesting}
                 className="flex-1 bg-gradient-to-r from-primary to-accent text-white px-4 py-2 rounded-lg hover:shadow-lg transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                {editingConnectionId ? 'Update Connection' : 'Add Connection'}
+                {isTesting ? (
+                  <div className="flex items-center justify-center space-x-2">
+                    <RefreshCw className="w-4 h-4 animate-spin" />
+                    <span>Testing & Saving...</span>
+                  </div>
+                ) : (
+                  editingConnectionId ? 'Update Connection' : 'Add Connection'
+                )}
               </button>
             </div>
           </div>

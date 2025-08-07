@@ -9,6 +9,8 @@ import {
   updateDoc, 
   query, 
   where,
+  orderBy,
+  writeBatch,
   Timestamp,
   getDoc
 } from "firebase/firestore";
@@ -19,17 +21,26 @@ import {
   PersistentCache, 
   CACHE_KEYS 
 } from "../utils/optimizations";
+import { verifyFirebaseConfig } from "./env-verification";
 
-// Firebase configuration
+// Verify environment variables are loaded
+verifyFirebaseConfig();
+
+// Firebase configuration using environment variables
 const firebaseConfig = {
-  apiKey: "AIzaSyC6lGBdv-Z85Q5YniFpa9AqjvJxnorNdDM",
-  authDomain: "bookgx-18438.firebaseapp.com",
-  projectId: "bookgx-18438",
-  storageBucket: "bookgx-18438.firebasestorage.app",
-  messagingSenderId: "533182478580",
-  appId: "1:533182478580:web:2bb824d86f531946d6c6a1",
-  measurementId: "G-BEDZKGBZCP"
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID,
+  measurementId: import.meta.env.VITE_FIREBASE_MEASUREMENT_ID
 };
+
+// Validate that all required environment variables are present
+if (!firebaseConfig.apiKey || !firebaseConfig.authDomain || !firebaseConfig.projectId) {
+  throw new Error('Missing required Firebase environment variables. Please check your .env file.');
+}
 
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
@@ -139,6 +150,7 @@ export interface FirestoreHeader {
   variableName: string;
   dataType: 'text' | 'number' | 'date' | 'boolean';
   isEnabled: boolean;
+  isKey: boolean;
   createdAt?: Timestamp;
   lastUpdated?: Timestamp;
 }
@@ -237,15 +249,12 @@ export async function loadConnections(region: 'saudi' | 'egypt'): Promise<any[]>
  */
 export async function deleteConnection(connectionId: string): Promise<void> {
   try {
-    console.log('🔥 Deleting connection from Firebase:', connectionId);
-    
     // First delete all subcollections (databases, tables, headers)
     await deleteConnectionSubcollections(connectionId);
     
     // Then delete the connection document
     const ref = doc(db, "connections", connectionId);
     await deleteDoc(ref);
-    console.log("✅ Connection deleted from Firebase");
   } catch (err) {
     console.error("❌ Error deleting connection:", err);
     throw err;
@@ -376,7 +385,6 @@ export async function loadDatabases(connectionId: string): Promise<any[]> {
  */
 export async function deleteDatabase(connectionId: string, databaseId: string): Promise<void> {
   try {
-    console.log('🔥 Deleting database from Firebase:', databaseId);
     
     // First delete all subcollections (tables, headers)
     await deleteDatabaseSubcollections(connectionId, databaseId);
@@ -384,7 +392,6 @@ export async function deleteDatabase(connectionId: string, databaseId: string): 
     // Then delete the database document
     const ref = doc(db, `connections/${connectionId}/databases`, databaseId);
     await deleteDoc(ref);
-    console.log("✅ Database deleted from Firebase");
   } catch (err) {
     console.error("❌ Error deleting database:", err);
     throw err;
@@ -468,7 +475,6 @@ export async function saveTable(connectionId: string, databaseId: string, table:
  */
 export async function loadTables(connectionId: string, databaseId: string): Promise<any[]> {
   try {
-    console.log('🔥 Loading tables from Firebase for database:', databaseId);
     
     const snapshot = await getDocs(collection(db, `connections/${connectionId}/databases/${databaseId}/tables`));
     const tables = snapshot.docs.map(doc => {
@@ -480,7 +486,6 @@ export async function loadTables(connectionId: string, databaseId: string): Prom
       };
     });
     
-    console.log(`✅ Loaded ${tables.length} tables from Firebase`);
     return tables;
   } catch (err) {
     console.error("❌ Error loading tables:", err);
@@ -493,7 +498,6 @@ export async function loadTables(connectionId: string, databaseId: string): Prom
  */
 export async function deleteTable(connectionId: string, databaseId: string, tableId: string): Promise<void> {
   try {
-    console.log('🔥 Deleting table from Firebase:', tableId);
     
     // First delete all headers
     const headersSnapshot = await getDocs(collection(db, `connections/${connectionId}/databases/${databaseId}/tables/${tableId}/headers`));
@@ -504,7 +508,6 @@ export async function deleteTable(connectionId: string, databaseId: string, tabl
     // Then delete the table document
     const ref = doc(db, `connections/${connectionId}/databases/${databaseId}/tables`, tableId);
     await deleteDoc(ref);
-    console.log("✅ Table deleted from Firebase");
   } catch (err) {
     console.error("❌ Error deleting table:", err);
     throw err;
@@ -516,7 +519,7 @@ export async function deleteTable(connectionId: string, databaseId: string, tabl
 // =============================================================================
 
 /**
- * Save or update headers for a table in Firestore with optimization
+ * Save or update headers for a table in Firestore with optimization and handle deletions
  */
 export async function saveHeaders(connectionId: string, databaseId: string, tableId: string, headers: any[]): Promise<void> {
   try {
@@ -525,33 +528,67 @@ export async function saveHeaders(connectionId: string, databaseId: string, tabl
     // Load existing headers to compare
     const existingHeaders = await loadHeaders(connectionId, databaseId, tableId);
     const existingHeadersMap = new Map(existingHeaders.map(h => [h.id, h]));
+    const newHeaderIds = new Set(headers.map(h => h.id));
     
-    // Only save headers that have actually changed
+    // Find headers that need to be deleted (exist in Firebase but not in new headers array)
+    const headersToDelete = existingHeaders.filter(header => !newHeaderIds.has(header.id));
+    
+    // Find headers that have changed or are new
     const changedHeaders = headers.filter(header => {
       const existing = existingHeadersMap.get(header.id);
       if (!existing) return true; // New header
       return hasDataChanged(header, existing);
     });
     
-    if (changedHeaders.length === 0) {
-      Logger.debug('No header changes detected, skipping save');
+    // Check if there are any changes to process
+    if (changedHeaders.length === 0 && headersToDelete.length === 0) {
+      Logger.debug('No header changes or deletions detected, skipping save');
       return;
     }
     
-    const promises = changedHeaders.map(header => {
-      const headerData: FirestoreHeader = {
-        ...header,
-        lastUpdated: Timestamp.now(),
-        createdAt: header.createdAt ? Timestamp.fromDate(header.createdAt) : Timestamp.now()
-      };
+    const promises = [];
+    
+    // Handle updates and new headers
+    if (changedHeaders.length > 0) {
+      const updatePromises = changedHeaders.map(header => {
+        const headerData: FirestoreHeader = {
+          ...header,
+          lastUpdated: Timestamp.now(),
+          createdAt: header.createdAt ? Timestamp.fromDate(header.createdAt) : Timestamp.now()
+        };
 
-      const cleanedData = removeUndefined(headerData);
-      const ref = doc(db, `connections/${connectionId}/databases/${databaseId}/tables/${tableId}/headers`, header.id);
-      return setDoc(ref, cleanedData);
-    });
+        const cleanedData = removeUndefined(headerData);
+        const ref = doc(db, `connections/${connectionId}/databases/${databaseId}/tables/${tableId}/headers`, header.id);
+        return setDoc(ref, cleanedData);
+      });
+      promises.push(...updatePromises);
+      Logger.debug(`${changedHeaders.length} headers will be updated/added`);
+    }
+    
+    // Handle deletions
+    if (headersToDelete.length > 0) {
+      const deletePromises = headersToDelete.map(header => {
+        const ref = doc(db, `connections/${connectionId}/databases/${databaseId}/tables/${tableId}/headers`, header.id);
+        Logger.debug(`Deleting header: ${header.originalHeader} (ID: ${header.id})`);
+        return deleteDoc(ref);
+      });
+      promises.push(...deletePromises);
+      Logger.debug(`${headersToDelete.length} headers will be deleted`);
+    }
 
+    // Execute all operations
     await Promise.all(promises);
-    Logger.success(`${changedHeaders.length} headers updated for table: ${tableId}`);
+    
+    let successMessage = '';
+    if (changedHeaders.length > 0 && headersToDelete.length > 0) {
+      successMessage = `${changedHeaders.length} headers updated/added and ${headersToDelete.length} headers deleted for table: ${tableId}`;
+    } else if (changedHeaders.length > 0) {
+      successMessage = `${changedHeaders.length} headers updated/added for table: ${tableId}`;
+    } else if (headersToDelete.length > 0) {
+      successMessage = `${headersToDelete.length} headers deleted for table: ${tableId}`;
+    }
+    
+    Logger.success(successMessage);
     
     // Clear relevant caches
     sessionCache.clear(`headers_${connectionId}_${databaseId}_${tableId}`);
@@ -603,13 +640,323 @@ export async function loadHeaders(connectionId: string, databaseId: string, tabl
  */
 export async function deleteHeader(connectionId: string, databaseId: string, tableId: string, headerId: string): Promise<void> {
   try {
-    console.log('🔥 Deleting header from Firebase:', headerId);
+    Logger.debug(`Deleting header with ID: ${headerId} from table: ${tableId}`);
     
     const ref = doc(db, `connections/${connectionId}/databases/${databaseId}/tables/${tableId}/headers`, headerId);
     await deleteDoc(ref);
-    console.log("✅ Header deleted from Firebase");
+    
+    Logger.success(`Header deleted successfully: ${headerId}`);
+    
+    // Clear relevant caches
+    sessionCache.clear(`headers_${connectionId}_${databaseId}_${tableId}`);
+    
   } catch (err) {
-    console.error("❌ Error deleting header:", err);
+    Logger.error("Error deleting header:", err);
+    throw err;
+  }
+}
+
+/**
+ * Save spreadsheet data to Firebase for a specific table
+ */
+export async function saveSpreadsheetData(
+  connectionId: string, 
+  databaseId: string, 
+  tableId: string, 
+  data: any[], 
+  headers: any[]
+): Promise<void> {
+  try {
+    Logger.debug('Saving spreadsheet data to Firebase for table:', tableId);
+    
+    // Get enabled headers only
+    const enabledHeaders = headers.filter(h => h.isEnabled);
+    const keyHeader = headers.find(h => h.isKey);
+    
+    Logger.debug(`Processing ${data.length} rows with ${enabledHeaders.length} enabled headers`);
+    
+    if (!keyHeader) {
+      throw new Error('No key header found. Please select a key column before syncing data.');
+    }
+    
+    Logger.debug(`Using key column: ${keyHeader.originalHeader} (index: ${keyHeader.columnIndex})`);
+    
+    // Track document IDs to prevent duplicates within the same sync
+    const documentIdTracker = new Map<string, number>();
+    const duplicateKeyValues = new Set<string>();
+    
+    // Process and filter data based on enabled headers
+    const filteredData = data.map((row, rowIndex) => {
+      // Get the key value from the specified column
+      const keyValue = row[keyHeader.columnIndex];
+      
+      if (!keyValue || String(keyValue).trim() === '') {
+        Logger.warn(`Skipping row ${rowIndex + 1}: empty key value in column "${keyHeader.originalHeader}"`);
+        return null; // Skip rows with empty key values
+      }
+      
+      Logger.debug(`Processing row ${rowIndex + 1} with key value: "${keyValue}"`);
+      
+      // Clean the key value to make it a valid Firebase document ID
+      let documentId = String(keyValue).trim();
+      
+      // Firebase document ID restrictions:
+      // - Must not be empty
+      // - Must not contain forward slashes (/)
+      // - Must not solely consist of periods (.)
+      // - Must not be longer than 1,500 bytes
+      // - Must not start with '__' (reserved for Firebase)
+      
+      // Replace invalid characters and patterns
+      documentId = documentId
+        .replace(/\//g, '_slash_')          // Replace forward slashes
+        .replace(/\./g, '_dot_')            // Replace periods
+        .replace(/\s+/g, '_')               // Replace spaces with underscores
+        .replace(/[^a-zA-Z0-9_-]/g, '_')    // Replace other invalid characters
+        .replace(/_+/g, '_')                // Replace multiple underscores with single
+        .replace(/^_|_$/g, '');             // Remove leading/trailing underscores
+      
+      // Ensure it doesn't start with __ (reserved by Firebase)
+      if (documentId.startsWith('__')) {
+        documentId = 'doc_' + documentId;
+      }
+      
+      // Ensure it's not empty and not just periods
+      if (!documentId || documentId === '' || /^\.+$/.test(documentId)) {
+        documentId = `doc_${Date.now()}_${rowIndex}`;
+      }
+      
+      // Limit length to 100 characters (well under Firebase's 1500 byte limit)
+      documentId = documentId.substring(0, 100);
+      
+      // Final safety check - ensure it ends with alphanumeric if it got truncated
+      if (documentId.endsWith('_')) {
+        documentId = documentId.slice(0, -1) + 'x';
+      }
+      
+      Logger.debug(`Original key: "${keyValue}" -> Document ID: "${documentId}"`);
+      
+      // Check for duplicate document IDs within this sync batch
+      if (documentIdTracker.has(documentId)) {
+        const previousRowIndex = documentIdTracker.get(documentId)!;
+        Logger.warn(`Duplicate key detected! Row ${rowIndex + 1} has same key as row ${previousRowIndex + 1}: "${keyValue}" -> Document ID: "${documentId}"`);
+        duplicateKeyValues.add(keyValue);
+        
+        // Append row index to make it unique for this sync
+        documentId = `${documentId}_row${rowIndex}`;
+        Logger.debug(`Modified duplicate to unique ID: "${documentId}"`);
+      }
+      
+      // Track this document ID
+      documentIdTracker.set(documentId, rowIndex);
+      
+      const processedRow: any = {
+        id: documentId,
+        originalKeyValue: keyValue, // Store the original key value
+        rowIndex: rowIndex,
+        createdAt: Timestamp.now(),
+        lastUpdated: Timestamp.now()
+      };
+      
+      // Add data for each enabled header
+      enabledHeaders.forEach(header => {
+        const cellValue = row[header.columnIndex];
+        let processedValue = cellValue;
+        
+        // Process value based on data type
+        switch (header.dataType) {
+          case 'number':
+            processedValue = cellValue ? parseFloat(cellValue) : null;
+            break;
+          case 'date':
+            if (cellValue) {
+              try {
+                processedValue = Timestamp.fromDate(new Date(cellValue));
+              } catch {
+                processedValue = cellValue; // Keep as string if date parsing fails
+              }
+            }
+            break;
+          case 'boolean':
+            processedValue = cellValue ? 
+              ['true', '1', 'yes', 'on'].includes(String(cellValue).toLowerCase()) : 
+              false;
+            break;
+          default: // text
+            processedValue = cellValue ? String(cellValue) : '';
+        }
+        
+        processedRow[header.variableName] = processedValue;
+      });
+      
+      return processedRow;
+    }).filter(row => row !== null); // Remove null rows (empty key values)
+    
+    Logger.debug(`Filtered to ${filteredData.length} valid rows with non-empty key values`);
+    
+    // Report duplicate key statistics
+    if (duplicateKeyValues.size > 0) {
+      Logger.warn(`Found ${duplicateKeyValues.size} duplicate key values in the spreadsheet:`);
+      duplicateKeyValues.forEach(key => {
+        Logger.warn(`  - Duplicate key: "${key}"`);
+      });
+      Logger.info('Duplicate rows have been made unique by appending row numbers to their document IDs');
+    }
+    
+    // Verify all document IDs are unique
+    const uniqueDocIds = new Set(filteredData.map(row => row.id));
+    if (uniqueDocIds.size !== filteredData.length) {
+      throw new Error('Internal error: Document IDs are not unique after processing. This should not happen.');
+    }
+    
+    Logger.success(`All ${filteredData.length} document IDs are verified unique`);
+    
+    // Save data in batches to avoid Firestore limits
+    const batchSize = 450; // Firestore batch limit is 500, keeping some margin
+    const batches: any[] = [];
+    
+    for (let i = 0; i < filteredData.length; i += batchSize) {
+      const batch = writeBatch(db);
+      const batchData = filteredData.slice(i, i + batchSize);
+      
+      batchData.forEach(rowData => {
+        const cleanedData = removeUndefined(rowData);
+        // Use the processed key value as the document ID
+        const ref = doc(db, `connections/${connectionId}/databases/${databaseId}/tables/${tableId}/data`, rowData.id);
+        batch.set(ref, cleanedData, { merge: true }); // Use merge to update existing documents
+      });
+      
+      batches.push(batch);
+    }
+    
+    // Execute all batches
+    await Promise.all(batches.map(batch => batch.commit()));
+    
+    Logger.success(`Successfully committed ${batches.length} batches to Firebase`);
+    
+    // Update table metadata with data info
+    const tableRef = doc(db, `connections/${connectionId}/databases/${databaseId}/tables`, tableId);
+    await updateDoc(tableRef, {
+      dataRowCount: filteredData.length,
+      dataHeaders: enabledHeaders.map(h => h.variableName),
+      keyColumn: keyHeader.variableName,
+      keyColumnOriginal: keyHeader.originalHeader,
+      lastDataSync: Timestamp.now(),
+      lastUpdated: Timestamp.now(),
+      // Add sync statistics
+      syncStats: {
+        totalRowsProcessed: data.length,
+        validRowsSaved: filteredData.length,
+        skippedRows: data.length - filteredData.length,
+        duplicateKeysFound: duplicateKeyValues.size,
+        lastSyncDate: Timestamp.now()
+      }
+    });
+    
+    Logger.success(`Successfully saved ${filteredData.length} rows of spreadsheet data to Firebase using key column "${keyHeader.originalHeader}"`);
+    
+    if (duplicateKeyValues.size > 0) {
+      Logger.info(`Sync completed with ${duplicateKeyValues.size} duplicate key values handled. Each duplicate was made unique with row number suffix.`);
+    }
+    
+    // Clear relevant caches
+    sessionCache.clear(`table_data_${connectionId}_${databaseId}_${tableId}`);
+    
+  } catch (err) {
+    Logger.error("Error saving spreadsheet data:", err);
+    throw err;
+  }
+}
+
+/**
+ * Load spreadsheet data from Firebase for a specific table
+ */
+export async function loadSpreadsheetData(
+  connectionId: string, 
+  databaseId: string, 
+  tableId: string
+): Promise<any[]> {
+  try {
+    const cacheKey = `table_data_${connectionId}_${databaseId}_${tableId}`;
+    
+    // Check session cache first
+    if (sessionCache.has(cacheKey)) {
+      Logger.debug('Loading spreadsheet data from cache');
+      return sessionCache.get(cacheKey);
+    }
+    
+    Logger.debug('Loading spreadsheet data from Firebase for table:', tableId);
+    
+    const dataRef = collection(db, `connections/${connectionId}/databases/${databaseId}/tables/${tableId}/data`);
+    const snapshot = await getDocs(query(dataRef, orderBy('rowIndex', 'asc')));
+    
+    const data = snapshot.docs.map(doc => ({
+      firestoreId: doc.id,
+      ...doc.data(),
+      createdAt: doc.data().createdAt?.toDate?.() || new Date(),
+      lastUpdated: doc.data().lastUpdated?.toDate?.() || new Date()
+    }));
+    
+    // Cache for 5 minutes
+    sessionCache.set(cacheKey, data, 5);
+    
+    Logger.success(`Loaded ${data.length} rows of spreadsheet data from Firebase`);
+    return data;
+    
+  } catch (err) {
+    Logger.error("Error loading spreadsheet data:", err);
+    throw err;
+  }
+}
+
+/**
+ * Delete all spreadsheet data for a specific table
+ */
+export async function deleteSpreadsheetData(
+  connectionId: string, 
+  databaseId: string, 
+  tableId: string
+): Promise<void> {
+  try {
+    Logger.debug('Deleting all spreadsheet data for table:', tableId);
+    
+    const dataRef = collection(db, `connections/${connectionId}/databases/${databaseId}/tables/${tableId}/data`);
+    const snapshot = await getDocs(dataRef);
+    
+    // Delete in batches
+    const batchSize = 450;
+    const batches: any[] = [];
+    
+    for (let i = 0; i < snapshot.docs.length; i += batchSize) {
+      const batch = writeBatch(db);
+      const batchDocs = snapshot.docs.slice(i, i + batchSize);
+      
+      batchDocs.forEach(doc => {
+        batch.delete(doc.ref);
+      });
+      
+      batches.push(batch);
+    }
+    
+    // Execute all batches
+    await Promise.all(batches.map(batch => batch.commit()));
+    
+    // Update table metadata
+    const tableRef = doc(db, `connections/${connectionId}/databases/${databaseId}/tables`, tableId);
+    await updateDoc(tableRef, {
+      dataRowCount: 0,
+      dataHeaders: [],
+      lastDataSync: null,
+      lastUpdated: Timestamp.now()
+    });
+    
+    Logger.success(`Deleted all spreadsheet data for table: ${tableId}`);
+    
+    // Clear relevant caches
+    sessionCache.clear(`table_data_${connectionId}_${databaseId}_${tableId}`);
+    
+  } catch (err) {
+    Logger.error("Error deleting spreadsheet data:", err);
     throw err;
   }
 }
@@ -623,8 +970,7 @@ export async function deleteHeader(connectionId: string, databaseId: string, tab
  */
 export async function initializeFirebase(): Promise<void> {
   try {
-    console.log('🔥 Firebase initialized and ready!');
-    console.log('📊 Database reference:', db.app.name);
+    // Firebase initialized and ready
   } catch (err) {
     console.error("❌ Error initializing Firebase:", err);
   }

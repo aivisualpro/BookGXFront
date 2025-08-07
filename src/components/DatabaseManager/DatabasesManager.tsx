@@ -83,14 +83,12 @@ interface DatabasesManagerProps {
   setCurrentView: (view: 'connections' | 'databases' | 'tables' | 'headers') => void;
   selectedConnection: string;
   setSelectedDatabase: (databaseId: string) => void;
-  activeTab: 'saudi' | 'egypt';
 }
 
 export function DatabasesManager({ 
   setCurrentView, 
   selectedConnection, 
-  setSelectedDatabase, 
-  activeTab 
+  setSelectedDatabase
 }: DatabasesManagerProps) {
   // Local state for databases
   const [databases, setDatabases] = useState<DatabaseConnection[]>([]);
@@ -100,6 +98,7 @@ export function DatabasesManager({
 
   // Modal states
   const [showAddDatabase, setShowAddDatabase] = useState(false);
+  const [isTesting, setIsTesting] = useState(false);
 
   // Form states
   const [newDatabaseName, setNewDatabaseName] = useState('');
@@ -148,7 +147,9 @@ export function DatabasesManager({
   // Helper to get current connection data
   const getCurrentConnection = async (): Promise<GoogleConnection | null> => {
     try {
-      const connections = await loadConnections(activeTab);
+      // Determine region from connection ID
+      const region = selectedConnection.startsWith('Saudi_') ? 'saudi' : 'egypt';
+      const connections = await loadConnections(region);
       return connections.find(conn => conn.id === selectedConnection) || null;
     } catch (error) {
       console.error('❌ Failed to load connection:', error);
@@ -289,69 +290,78 @@ export function DatabasesManager({
       return;
     }
 
-    const newDatabase: DatabaseConnection = {
-      id: generateId(),
-      name: newDatabaseName.trim(),
-      googleSheetId: newDatabaseSheetId.trim(),
-      status: 'loading',
-      createdAt: new Date(),
-      sheetsConnected: 0,
-      tables: []
-    };
+    // Generate meaningful ID based on connection name and database name
+    const sanitizedConnectionName = currentConnection.name.replace(/[^a-zA-Z0-9]/g, '_');
+    const sanitizedDatabaseName = newDatabaseName.trim().replace(/[^a-zA-Z0-9]/g, '_');
+    const databaseId = `${sanitizedConnectionName}_${sanitizedDatabaseName}`;
 
-    const currentDatabases = getCurrentDatabases();
-    const tempDatabases = [...currentDatabases, newDatabase];
-    setDatabases(tempDatabases);
-    
+    setIsTesting(true);
+
     try {
+      // Create database object for testing
+      const databaseToTest: DatabaseConnection = {
+        id: databaseId,
+        name: newDatabaseName.trim(),
+        googleSheetId: newDatabaseSheetId.trim(),
+        status: 'testing',
+        createdAt: new Date(),
+        sheetsConnected: 0,
+        tables: []
+      };
+
+      const currentDatabases = getCurrentDatabases();
+      const tempDatabases = [...currentDatabases, databaseToTest];
+      setDatabases(tempDatabases);
+      
+      // Test the Google Sheet connection
       const sheetNames = await fetchAvailableSheets(newDatabaseSheetId.trim(), currentConnection);
       
       // Ensure sheetNames is an array to prevent length errors
       const sheetsArray = Array.isArray(sheetNames) ? sheetNames : [];
       
+      if (sheetsArray.length === 0) {
+        throw new Error('No sheets found in the Google Spreadsheet. Please check the Sheet ID and ensure the spreadsheet contains at least one sheet.');
+      }
+
       const finalDatabase = {
-        ...newDatabase,
+        ...databaseToTest,
         status: 'connected' as const,
         totalSheetsAvailable: sheetsArray.length,
         availableSheetNames: sheetsArray,
+        lastTested: new Date(),
         errorMessage: undefined
       };
 
-      // Save to Firebase
+      // Save to Firebase only after successful test
       await saveDatabase(selectedConnection, finalDatabase);
 
       // Update local state
       const finalDatabases = tempDatabases.map(db => 
-        db.id === newDatabase.id ? finalDatabase : db
+        db.id === databaseToTest.id ? finalDatabase : db
       );
       setDatabases(finalDatabases);
       
       Logger.success(`Successfully connected to Google Sheet with ${sheetsArray.length} sheets:`, sheetsArray);
       
+      // Reset form only after successful save
+      setNewDatabaseName('');
+      setNewDatabaseSheetId('');
+      setShowAddDatabase(false);
+      
     } catch (error) {
       Logger.error('Error connecting to Google Sheet:', error);
       
-      const errorDatabase = {
-        ...newDatabase,
-        status: 'error' as const,
-        errorMessage: error instanceof Error ? error.message : 'Unknown error occurred',
-        totalSheetsAvailable: 0,
-        availableSheetNames: []
-      };
-
-      // Save error state to Firebase
-      await saveDatabase(selectedConnection, errorDatabase);
-
-      // Update local state with error
-      const errorDatabases = tempDatabases.map(db => 
-        db.id === newDatabase.id ? errorDatabase : db
-      );
-      setDatabases(errorDatabases);
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
+      
+      // Remove failed database from UI
+      const currentDatabases = getCurrentDatabases();
+      setDatabases(currentDatabases);
+      
+      // Show error to user
+      alert(`Database connection test failed: ${errorMessage}\n\nPlease check your Google Sheet ID and ensure:\n1. The spreadsheet exists and is accessible\n2. The Google Sheets API is enabled\n3. Your API key has proper permissions`);
+    } finally {
+      setIsTesting(false);
     }
-    
-    setNewDatabaseName('');
-    setNewDatabaseSheetId('');
-    setShowAddDatabase(false);
   };
 
   const deleteDatabase = async (databaseId: string) => {
@@ -364,7 +374,6 @@ export function DatabasesManager({
       const updatedDatabases = currentDatabases.filter(db => db.id !== databaseId);
       setDatabases(updatedDatabases);
 
-      console.log('✅ Database deleted successfully');
     } catch (error) {
       console.error('❌ Failed to delete database:', error);
     }
@@ -400,7 +409,6 @@ export function DatabasesManager({
       );
       setDatabases(updatedDatabases);
       
-      console.log(`✅ Successfully refreshed database with ${sheetNames.length} sheets:`, sheetNames);
     } catch (error) {
       console.error('❌ Failed to refresh database:', error);
       
@@ -516,26 +524,12 @@ export function DatabasesManager({
     };
 
     loadConnectionData();
-  }, [selectedConnection, activeTab]);
+  }, [selectedConnection]);
 
   const currentDatabases = getCurrentDatabases();
 
   return (
     <div className="max-w-7xl mx-auto">
-      {/* Breadcrumb */}
-      <div className="flex items-center space-x-4 mb-6">
-        <button
-          onClick={() => setCurrentView('connections')}
-          className="flex items-center space-x-2 text-gray-400 hover:text-white transition-colors"
-        >
-          <ArrowLeft className="w-4 h-4" />
-          <span>Back to Connections</span>
-        </button>
-        <div className="text-gray-400">/</div>
-        <div className="text-white font-medium">
-          {selectedConnectionData?.name || 'Unknown Connection'}
-        </div>
-      </div>
 
       {/* Level 2: Databases */}
       <div className="space-y-6">
@@ -568,19 +562,25 @@ export function DatabasesManager({
           ) : (
             <div className="space-y-4">
               {currentDatabases.map((database) => (
-                <div key={database.id} className="bg-white/5 rounded-lg p-4 border border-white/10">
+                <div key={database.id} className="bg-white/5 rounded-lg p-4 border border-white/10 hover:bg-white/10 hover:border-blue-500/30 transition-all duration-200 group">
                   <div className="flex items-center justify-between">
                     <div 
-                      className="flex items-center space-x-3 cursor-pointer flex-1"
+                      className="flex items-center space-x-3 cursor-pointer flex-1 hover:bg-white/10 rounded-lg p-2 transition-all duration-200 border border-transparent hover:border-blue-500/30"
                       onClick={() => {
+                        console.log('🔍 Database clicked:', database.name, database.id);
                         setSelectedDatabase(database.id);
-                        setCurrentView('tables');
+                        // Note: Don't call setCurrentView('tables') here as it causes navigation conflicts
+                        // The URL parsing logic will automatically determine the view based on the URL
                       }}
+                      title={`Click to view tables in ${database.name}`}
                     >
                       {getStatusIcon(database.status)}
-                      <div>
-                        <div className="text-white font-medium hover:text-blue-400 transition-colors">
+                      <div className="flex-1">
+                        <div className="text-white font-medium hover:text-blue-400 transition-colors group-hover:text-blue-300">
                           {database.name}
+                          <span className="ml-2 text-xs text-blue-400 opacity-0 group-hover:opacity-100 transition-opacity">
+                            → Click to view tables
+                          </span>
                         </div>
                         <div className="text-sm text-gray-400">
                           Sheet ID: {database.googleSheetId}
@@ -660,17 +660,30 @@ export function DatabasesManager({
             
             <div className="flex space-x-3 mt-6">
               <button
-                onClick={() => setShowAddDatabase(false)}
-                className="flex-1 bg-gray-600 text-white px-4 py-2 rounded-lg hover:bg-gray-700 transition-colors"
+                onClick={() => {
+                  setShowAddDatabase(false);
+                  setNewDatabaseName('');
+                  setNewDatabaseSheetId('');
+                  setIsTesting(false);
+                }}
+                disabled={isTesting}
+                className="flex-1 bg-gray-600 text-white px-4 py-2 rounded-lg hover:bg-gray-700 transition-colors disabled:opacity-50"
               >
                 Cancel
               </button>
               <button
                 onClick={addDatabase}
-                disabled={!newDatabaseName.trim() || !newDatabaseSheetId.trim()}
+                disabled={!newDatabaseName.trim() || !newDatabaseSheetId.trim() || isTesting}
                 className="flex-1 bg-gradient-to-r from-primary to-accent text-white px-4 py-2 rounded-lg hover:shadow-lg transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                Add Database
+                {isTesting ? (
+                  <div className="flex items-center justify-center space-x-2">
+                    <RefreshCw className="w-4 h-4 animate-spin" />
+                    <span>Testing & Saving...</span>
+                  </div>
+                ) : (
+                  'Add Database'
+                )}
               </button>
             </div>
           </div>

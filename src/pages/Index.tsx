@@ -1,18 +1,17 @@
 import { useState, useEffect } from "react";
+import { useNavigate, useLocation } from "react-router-dom";
 import { DashboardLayout } from "@/components/dashboard/DashboardLayout";
 import { DashboardHeader } from "@/components/dashboard/DashboardHeader";
 import { UsersPage } from "@/components/dashboard/UsersPage";
-import { ConnectionPage } from "@/components/dashboard/ConnectionPage";
+import { UnifiedDataConnectionManager } from "@/components/ConnectionManager/UnifiedDataConnectionManager";
 import { LoginModal } from "@/components/dashboard/LoginModal";
-import { fetchUsersData, User } from "@/utils/usersData";
+import { useAuth } from "@/hooks/useAuth";
+import { User } from "@/utils/usersData";
 
 const Index = () => {
-  const [currentPage, setCurrentPage] = useState<'home' | 'users' | 'connection'>('home');
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const navigate = useNavigate();
+  const location = useLocation();
   const [showLoginModal, setShowLoginModal] = useState(false);
-  const [user, setUser] = useState<User | null>(null);
-  const [users, setUsers] = useState<User[]>([]);
-  const [loading, setLoading] = useState(true);
   const [dashboardData, setDashboardData] = useState<{
     dataSource: 'google_sheets' | 'mock_data';
     recordCount?: number;
@@ -20,73 +19,52 @@ const Index = () => {
     businessHealth?: number;
   } | null>(null);
 
-  // Load users data and check authentication on mount
-  useEffect(() => {
-    const initializeApp = async () => {
-      try {
-        const usersData = await fetchUsersData();
-        setUsers(usersData);
-        
-        // Check for existing dashboard authentication
-        const authCookie = document.cookie
-          .split('; ')
-          .find(row => row.startsWith('dashboard_auth='));
-        
-        if (authCookie) {
-          const authData = authCookie.split('=')[1];
-          try {
-            const userData = JSON.parse(decodeURIComponent(authData));
-            const foundUser = usersData.find(u => 
-              u.Name === userData.Name && 
-              u.Role === userData.Role
-            );
-            
-            if (foundUser) {
-              setUser(foundUser);
-              setIsAuthenticated(true);
-            }
-          } catch (error) {
-            console.error('Error parsing auth cookie:', error);
-          }
-        }
-      } catch (error) {
-        console.error('Error loading users data:', error);
-      } finally {
-        setLoading(false);
-      }
-    };
+  // Use consolidated authentication hook
+  const { isAuthenticated, user, users, loading, login, logout } = useAuth();
 
-    initializeApp();
-  }, []);
+  // Determine current page from URL
+  const getCurrentPage = (): 'home' | 'users' | 'connection' => {
+    const path = location.pathname;
+    if (path.startsWith('/connections')) return 'connection';
+    if (path.startsWith('/users')) return 'users';
+    return 'home';
+  };
+
+  const currentPage = getCurrentPage();
 
   const handleNavigate = (page: 'home' | 'users' | 'connection') => {
     if (!isAuthenticated && page === 'home') {
       setShowLoginModal(true);
       return;
     }
-    setCurrentPage(page);
+    
+    // Navigate to the appropriate URL
+    switch (page) {
+      case 'home':
+        navigate('/');
+        break;
+      case 'users':
+        navigate('/users');
+        break;
+      case 'connection':
+        navigate('/connections');
+        break;
+    }
   };
 
   const handleLoginSuccess = (loggedInUser: User) => {
-    // Set cookie for 24 hours
-    const expires = new Date();
-    expires.setTime(expires.getTime() + (24 * 60 * 60 * 1000)); // 24 hours
-    const userData = encodeURIComponent(JSON.stringify({
-      Name: loggedInUser.Name,
-      Role: loggedInUser.Role
-    }));
-    document.cookie = `dashboard_auth=${userData}; expires=${expires.toUTCString()}; path=/`;
-    
-    setUser(loggedInUser);
-    setIsAuthenticated(true);
+    login(loggedInUser);
     setShowLoginModal(false);
-    setCurrentPage('home');
+    if (location.pathname === '/' || location.pathname === '/home') {
+      // Stay on current page if already on home
+    } else {
+      navigate('/');
+    }
   };
 
   const handleLogout = () => {
-    setUser(null);
-    setIsAuthenticated(false);
-    setCurrentPage('home');
+    logout();
+    navigate('/');
   };
 
   const handleLoginClose = () => {
@@ -100,6 +78,10 @@ const Index = () => {
     businessHealth?: number;
   }) => {
     setDashboardData(data);
+  };
+
+  const handleConnectionBack = () => {
+    navigate('/');
   };
 
   // Show loading state
@@ -290,7 +272,7 @@ const Index = () => {
         ) : currentPage === 'users' ? (
           <UsersPage />
         ) : currentPage === 'connection' ? (
-          <ConnectionPage onBack={() => handleNavigate('home')} />
+          <UnifiedDataConnectionManager onBack={handleConnectionBack} />
         ) : null}
       </div>
 

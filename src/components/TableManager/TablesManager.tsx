@@ -18,7 +18,8 @@ import {
   loadTables, 
   deleteTable as deleteFirebaseTable,
   loadConnections,
-  loadDatabases
+  loadDatabases,
+  loadHeaders
 } from '../../lib/firebase';
 
 // Google Sheets API imports
@@ -92,15 +93,13 @@ interface TablesManagerProps {
   selectedConnection: string;
   selectedDatabase: string;
   setSelectedTable: (tableId: string) => void;
-  activeTab: 'saudi' | 'egypt';
 }
 
 export function TablesManager({ 
   setCurrentView, 
   selectedConnection, 
   selectedDatabase, 
-  setSelectedTable, 
-  activeTab 
+  setSelectedTable
 }: TablesManagerProps) {
   // State management
   const [tables, setTables] = useState<TableConnection[]>([]);
@@ -121,7 +120,27 @@ export function TablesManager({
         try {
           // Load tables from Firebase
           const tablesData = await loadTables(selectedConnection, selectedDatabase);
-          setTables(tablesData);
+          
+          // Load headers for each table and calculate enabled count
+          const tablesWithHeaderCounts = await Promise.all(
+            tablesData.map(async (table) => {
+              try {
+                const headers = await loadHeaders(selectedConnection, selectedDatabase, table.id);
+                const enabledHeaders = headers.filter(h => h.isEnabled);
+                return {
+                  ...table,
+                  totalHeaders: headers.length || table.totalHeaders,
+                  headersConnected: enabledHeaders.length
+                };
+              } catch (error) {
+                // If no headers found, keep original counts
+                console.debug(`No headers found for table ${table.name}, keeping original counts`);
+                return table;
+              }
+            })
+          );
+          
+          setTables(tablesWithHeaderCounts);
 
           // Load connection and database data
           const connectionData = await getCurrentConnection();
@@ -136,7 +155,77 @@ export function TablesManager({
     };
 
     loadData();
-  }, [selectedConnection, selectedDatabase, activeTab]);
+  }, [selectedConnection, selectedDatabase]);
+
+  // Refresh all header counts
+  const refreshAllHeaderCounts = async () => {
+    if (!selectedConnection || !selectedDatabase) return;
+    
+    try {
+      const updatedTables = await Promise.all(
+        tables.map(async (table) => {
+          try {
+            const headers = await loadHeaders(selectedConnection, selectedDatabase, table.id);
+            const enabledHeaders = headers.filter(h => h.isEnabled);
+            return {
+              ...table,
+              totalHeaders: headers.length || table.totalHeaders,
+              headersConnected: enabledHeaders.length
+            };
+          } catch (error) {
+            console.debug(`No headers found for table ${table.name}, keeping original counts`);
+            return table;
+          }
+        })
+      );
+      
+      setTables(updatedTables);
+      console.log('✅ Refreshed header counts for all tables');
+    } catch (error) {
+      console.error('Error refreshing header counts:', error);
+    }
+  };
+
+  // Refresh header counts when component comes into focus (user returns from headers page)
+  useEffect(() => {
+    const handleFocus = () => {
+      refreshAllHeaderCounts();
+    };
+
+    window.addEventListener('focus', handleFocus);
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) {
+        refreshAllHeaderCounts();
+      }
+    });
+
+    return () => {
+      window.removeEventListener('focus', handleFocus);
+      document.removeEventListener('visibilitychange', handleFocus);
+    };
+  }, [selectedConnection, selectedDatabase, tables]);
+
+  // Helper to refresh header counts for a specific table
+  const refreshHeaderCounts = async (tableId: string) => {
+    try {
+      const headers = await loadHeaders(selectedConnection, selectedDatabase, tableId);
+      const enabledHeaders = headers.filter(h => h.isEnabled);
+      
+      setTables(prevTables => 
+        prevTables.map(table => 
+          table.id === tableId 
+            ? { 
+                ...table, 
+                totalHeaders: headers.length,
+                headersConnected: enabledHeaders.length 
+              }
+            : table
+        )
+      );
+    } catch (error) {
+      console.debug(`Could not refresh header counts for table ${tableId}:`, error);
+    }
+  };
 
   // Helper functions
   const generateId = () => Math.random().toString(36).substr(2, 9);
@@ -144,7 +233,9 @@ export function TablesManager({
   // Helper to get current connection from Firebase
   const getCurrentConnection = async (): Promise<GoogleConnection | null> => {
     try {
-      const connections = await loadConnections(activeTab);
+      // Determine region from connection ID
+      const region = selectedConnection.startsWith('Saudi_') ? 'saudi' : 'egypt';
+      const connections = await loadConnections(region);
       return connections.find(conn => conn.id === selectedConnection) || null;
     } catch (error) {
       console.error('Error loading connection:', error);
@@ -295,8 +386,12 @@ export function TablesManager({
       return;
     }
 
+    // Generate meaningful ID: DatabaseName_TableName
+    const meaningfulId = `${currentDatabase.name}_${newTableName.trim()}`;
+    console.log('🆔 Generated meaningful table ID:', meaningfulId);
+
     const newTable: TableConnection = {
-      id: generateId(),
+      id: meaningfulId,
       name: newTableName.trim(),
       sheetName: newTableSheetName.trim(),
       sheetId: generateId(),
@@ -319,7 +414,7 @@ export function TablesManager({
         ...newTable, 
         status: 'connected' as const,
         totalHeaders: headers.length,
-        headersConnected: 0,
+        headersConnected: headers.length, // All headers are enabled by default
         headers: headers.map((header, index) => ({
           id: generateId(),
           columnIndex: index,
@@ -516,27 +611,7 @@ export function TablesManager({
 
   return (
     <div className="max-w-7xl mx-auto">
-      {/* Breadcrumb */}
-      <div className="flex items-center space-x-4 mb-6">
-        <button
-          onClick={() => setCurrentView('connections')}
-          className="flex items-center space-x-2 text-gray-400 hover:text-white transition-colors"
-        >
-          <ArrowLeft className="w-4 h-4" />
-          <span>Back to Connections</span>
-        </button>
-        <div className="text-gray-400">/</div>
-        <button
-          onClick={() => setCurrentView('databases')}
-          className="text-gray-400 hover:text-white transition-colors"
-        >
-          {selectedConnectionData?.name || 'Unknown Connection'}
-        </button>
-        <div className="text-gray-400">/</div>
-        <div className="text-white font-medium">
-          {selectedDatabaseData?.name || 'Unknown Database'}
-        </div>
-      </div>
+      
 
       {/* Level 3: Tables */}
       <div className="space-y-6">
@@ -545,13 +620,23 @@ export function TablesManager({
             <h2 className="text-xl font-semibold text-white">
               Tables (Sheets/Tabs)
             </h2>
-            <button
-              onClick={() => setShowAddTable(true)}
-              className="flex items-center space-x-2 bg-gradient-to-r from-primary to-accent text-white px-4 py-2 rounded-lg hover:shadow-lg transition-all duration-200"
-            >
-              <Plus className="w-4 h-4" />
-              <span>Add Table</span>
-            </button>
+            <div className="flex items-center space-x-2">
+              <button
+                onClick={refreshAllHeaderCounts}
+                className="flex items-center space-x-2 bg-blue-600 hover:bg-blue-700 text-white px-3 py-2 rounded-lg transition-colors"
+                title="Refresh header counts for all tables"
+              >
+                <RefreshCw className="w-4 h-4" />
+                <span className="hidden sm:inline">Refresh</span>
+              </button>
+              <button
+                onClick={() => setShowAddTable(true)}
+                className="flex items-center space-x-2 bg-gradient-to-r from-primary to-accent text-white px-4 py-2 rounded-lg hover:shadow-lg transition-all duration-200"
+              >
+                <Plus className="w-4 h-4" />
+                <span>Add Table</span>
+              </button>
+            </div>
           </div>
 
           {currentTables.length === 0 ? (
@@ -573,7 +658,10 @@ export function TablesManager({
                   <div className="flex items-center justify-between">
                     <div 
                       className="flex items-center space-x-3 flex-1"
-                      onClick={() => {
+                      onClick={async () => {
+                        console.log('🔍 Table clicked:', table.name, table.id);
+                        // Refresh header counts before navigating
+                        await refreshHeaderCounts(table.id);
                         setSelectedTable(table.id);
                         setCurrentView('headers');
                       }}

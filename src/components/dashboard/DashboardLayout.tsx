@@ -10,6 +10,7 @@ import { DateRangeFilter } from "./DateRangeFilter";
 import { createDashboardAPI, transformToDashboardData } from "@/utils/googleSheets";
 import { fetchRealDashboardData } from "@/utils/realSheetsDataService";
 import { User } from "@/utils/usersData";
+import { configureDashboardDataSource } from "@/utils/dashboardDataSource";
 import { logger, startGroup, endGroup } from "@/utils/logger";
 
 interface DashboardData {

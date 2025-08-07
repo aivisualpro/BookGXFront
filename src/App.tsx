@@ -17,6 +17,12 @@ const App = () => (
       <BrowserRouter>
         <Routes>
           <Route path="/" element={<Index />} />
+          <Route path="/home" element={<Index />} />
+          <Route path="/users" element={<Index />} />
+          <Route path="/connections" element={<Index />} />
+          <Route path="/connections/:connectionId" element={<Index />} />
+          <Route path="/connections/:connectionId/:databaseId" element={<Index />} />
+          <Route path="/connections/:connectionId/:databaseId/:tableId" element={<Index />} />
           {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
           <Route path="*" element={<NotFound />} />
         </Routes>

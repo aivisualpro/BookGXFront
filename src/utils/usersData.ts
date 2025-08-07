@@ -1,3 +1,5 @@
+import { loadSpreadsheetData, loadConnections, loadDatabases, loadTables } from '../lib/firebase';
+
 export interface User {
   Name: string;
   Role: string;
@@ -5,57 +7,200 @@ export interface User {
   Cards?: string; // Comma-separated list of cards user can access
 }
 
-export async function fetchUsersData(): Promise<User[]> {
+// Configuration for Firebase data source
+// You'll need to update these IDs based on your actual Firebase structure
+let USERS_CONFIG = {
+  connectionId: 'Saudi_BookGX_API', // Update this with your actual connection ID
+  databaseId: 'BookGX_API_main_bookinggxplus_users_s', // Update this with your actual database ID  
+  tableId: 'main_bookinggxplus_users_s_Users' // Update this with your actual table ID for Users
+};
+
+/**
+ * Auto-detect the Users table by searching through connections/databases/tables
+ */
+async function autoDetectUsersTable(): Promise<{connectionId: string, databaseId: string, tableId: string} | null> {
   try {
-    const response = await fetch('https://docs.google.com/spreadsheets/d/1bJ6vpncb86X_em7JWt22Ydt7I3RhJrOQ5gC4qTgwQ4A/export?format=csv');
+    console.log('🔍 Auto-detecting Users table...');
     
-    if (!response.ok) {
-      throw new Error('Failed to fetch users data');
-    }
+    // Check both regions
+    const regions: ('saudi' | 'egypt')[] = ['saudi', 'egypt'];
     
-    const csvText = await response.text();
-    console.log('Raw CSV data:', csvText.substring(0, 500) + '...');
-    
-    const lines = csvText.split('\n');
-    console.log('CSV lines count:', lines.length);
-    
-    // Skip the header row and parse the data
-    const users: User[] = [];
-    
-    for (let i = 1; i < lines.length; i++) {
-      const line = lines[i].trim();
-      if (line) {
-        // Improved CSV parsing to handle quotes and spaces
-        const columns = parseCSVLine(line);
-        console.log(`Line ${i}:`, columns);
+    for (const region of regions) {
+      try {
+        const connections = await loadConnections(region);
+        console.log(`📋 Found ${connections.length} connections in ${region} region`);
         
-        if (columns.length >= 3) {
-          const user = {
-            Name: columns[0]?.trim() || '',
-            Role: columns[1]?.trim() || '',
-            Password: columns[2]?.trim() || '',
-            Cards: cleanCardString(columns[3]?.trim() || getDefaultCardsForRole(columns[1]?.trim() || ''))
-          };
-          
-          // Special debugging for newrec user
-          if (user.Name.toLowerCase().includes('newrec')) {
-            console.log('🔍 FOUND NEWREC USER:', user);
-            console.log('🔍 Cards string:', user.Cards);
-            console.log('🔍 Cards parsed:', user.Cards.split(',').map(card => card.trim()));
+        for (const connection of connections) {
+          try {
+            const databases = await loadDatabases(connection.id);
+            console.log(`📋 Found ${databases.length} databases in connection ${connection.name}`);
+            
+            for (const database of databases) {
+              try {
+                const tables = await loadTables(connection.id, database.id);
+                console.log(`📋 Found ${tables.length} tables in database ${database.name}`);
+                
+                // Look for tables with "user" in the name
+                const userTables = tables.filter(table => 
+                  table.name.toLowerCase().includes('user') || 
+                  table.sheetName.toLowerCase().includes('user')
+                );
+                
+                if (userTables.length > 0) {
+                  const userTable = userTables[0]; // Take the first match
+                  console.log('✅ Found potential Users table:', {
+                    connection: connection.name,
+                    database: database.name, 
+                    table: userTable.name,
+                    sheetName: userTable.sheetName
+                  });
+                  
+                  return {
+                    connectionId: connection.id,
+                    databaseId: database.id,
+                    tableId: userTable.id
+                  };
+                }
+              } catch (tableError) {
+                console.debug(`Could not load tables for database ${database.name}:`, tableError);
+              }
+            }
+          } catch (dbError) {
+            console.debug(`Could not load databases for connection ${connection.name}:`, dbError);
           }
-          
-          console.log('Parsed user:', user);
-          users.push(user);
         }
+      } catch (connectionError) {
+        console.debug(`Could not load connections for region ${region}:`, connectionError);
       }
     }
     
-    console.log('Final users array:', users);
-    return users;
+    console.log('⚠️ No Users table found via auto-detection');
+    return null;
   } catch (error) {
-    console.error('Error fetching users data:', error);
-    // Return mock data as fallback with card permissions
-    return [
+    console.error('❌ Error during auto-detection:', error);
+    return null;
+  }
+}
+
+export async function fetchUsersData(): Promise<User[]> {
+  try {
+    console.log('🔥 Fetching users data from Firebase...');
+    
+    // Try auto-detection first
+    const detectedConfig = await autoDetectUsersTable();
+    if (detectedConfig) {
+      console.log('✅ Auto-detected Users table configuration:', detectedConfig);
+      // Update config with detected values
+      USERS_CONFIG = detectedConfig;
+    } else {
+      console.log('⚠️ Using default configuration:', USERS_CONFIG);
+    }
+    
+    console.log('📋 Final configuration:', USERS_CONFIG);
+    
+    // Static Super Admin (not stored in Firebase)
+    const staticSuperAdmin: User = {
+      Name: 'Adeel',
+      Role: 'Super Admin',
+      Password: 'Abc123***',
+      Cards: 'ConnectionStatus,StatsOverview,RevenueChart,PerformanceIndicators,FullAccess'
+    };
+    
+    try {
+      // Fetch data from Firebase using the loadSpreadsheetData function
+      const firebaseData = await loadSpreadsheetData(
+        USERS_CONFIG.connectionId,
+        USERS_CONFIG.databaseId, 
+        USERS_CONFIG.tableId
+      );
+      
+      console.log('✅ Firebase data loaded:', firebaseData.length, 'records');
+      if (firebaseData.length > 0) {
+        console.log('📋 Sample Firebase record:', firebaseData[0]);
+        console.log('📋 Available fields:', Object.keys(firebaseData[0]));
+      }
+      
+      // Map Firebase data to User interface
+      const users: User[] = firebaseData.map((record: any, index: number) => {
+        // Try multiple field name variations for mapping
+        const nameFields = ['name', 'Name', 'username', 'email', 'user_name', 'full_name'];
+        const roleFields = ['role', 'Role', 'user_type', 'position', 'job_title'];
+        const passwordFields = ['password', 'Password', 'pass', 'pwd'];
+        const cardFields = ['cards', 'Cards', 'access_cards', 'permissions', 'access_level'];
+        
+        const getName = () => {
+          for (const field of nameFields) {
+            if (record[field]) return String(record[field]).trim();
+          }
+          return `User ${index + 1}`;
+        };
+        
+        const getRole = () => {
+          for (const field of roleFields) {
+            if (record[field]) return String(record[field]).trim();
+          }
+          return 'User';
+        };
+        
+        const getPassword = () => {
+          for (const field of passwordFields) {
+            if (record[field]) return String(record[field]).trim();
+          }
+          return '';
+        };
+        
+        const getCards = () => {
+          for (const field of cardFields) {
+            if (record[field]) return String(record[field]).trim();
+          }
+          return getDefaultCardsForRole(getRole());
+        };
+        
+        const user: User = {
+          Name: getName(),
+          Role: getRole(),
+          Password: getPassword(),
+          Cards: getCards()
+        };
+        
+        // Debug first few users
+        if (index < 3) {
+          console.log(`👤 Mapped user ${index + 1}:`, user);
+        }
+        
+        return user;
+      });
+      
+      // Add static super admin to the beginning of the list
+      const allUsers = [staticSuperAdmin, ...users];
+      console.log('✅ Successfully mapped', users.length, 'users from Firebase + 1 static super admin');
+      return allUsers;
+      
+    } catch (firebaseError) {
+      console.warn('⚠️ Firebase data fetch failed, using static super admin + mock data:', firebaseError);
+      // Even if Firebase fails, we still have the static super admin
+      return [staticSuperAdmin, ...getMockUsers()];
+    }
+    
+  } catch (error) {
+    console.error('❌ Error in fetchUsersData:', error);
+    console.log('🔄 Falling back to static super admin + mock data...');
+    
+    // Static Super Admin + Mock data fallback
+    const staticSuperAdmin: User = {
+      Name: 'Adeel',
+      Role: 'Super Admin', 
+      Password: 'Abc123***',
+      Cards: 'ConnectionStatus,StatsOverview,RevenueChart,PerformanceIndicators,FullAccess'
+    };
+    
+    return [staticSuperAdmin, ...getMockUsers()];
+  }
+}
+
+// Extract mock users into separate function for reusability
+function getMockUsers(): User[] {
+  return [
       { Name: 'adeel', Role: 'Admin', Password: '123', Cards: 'ConnectionStatus,StatsOverview,RevenueChart,PerformanceIndicators' },
       { Name: 'Abdul Hadi', Role: 'Admin', Password: '', Cards: 'ConnectionStatus,StatsOverview,RevenueChart,PerformanceIndicators' },
       { Name: 'Yasser', Role: 'Admin', Password: '', Cards: 'ConnectionStatus,StatsOverview,RevenueChart,PerformanceIndicators' },
@@ -111,42 +256,6 @@ export async function fetchUsersData(): Promise<User[]> {
       { Name: 'Gehan', Role: 'Artist Manager', Password: '', Cards: 'ConnectionStatus,StatsOverview,RevenueChart' }
     ];
   }
-}
-
-// Helper function to parse CSV line with proper quote handling
-function parseCSVLine(line: string): string[] {
-  const result: string[] = [];
-  let current = '';
-  let inQuotes = false;
-  
-  for (let i = 0; i < line.length; i++) {
-    const char = line[i];
-    
-    if (char === '"') {
-      inQuotes = !inQuotes;
-    } else if (char === ',' && !inQuotes) {
-      result.push(current.trim());
-      current = '';
-    } else {
-      current += char;
-    }
-  }
-  
-  result.push(current.trim());
-  return result;
-}
-
-// Helper function to clean card string (remove quotes and extra spaces)
-function cleanCardString(cards: string): string {
-  if (!cards) return '';
-  
-  return cards
-    .replace(/"/g, '') // Remove quotes
-    .split(',')
-    .map(card => card.trim())
-    .filter(card => card.length > 0)
-    .join(',');
-}
 
 // Helper function to get default cards based on role
 function getDefaultCardsForRole(role: string): string {
@@ -166,4 +275,28 @@ function getDefaultCardsForRole(role: string): string {
     default:
       return 'ConnectionStatus,StatsOverview';
   }
+}
+
+/**
+ * Helper function to update the Firebase configuration for users data
+ * Call this function with your actual Firebase table IDs
+ */
+export function configureUsersDataSource(connectionId: string, databaseId: string, tableId: string) {
+  console.log('🔧 Updating users data source configuration:');
+  console.log('Connection ID:', connectionId);
+  console.log('Database ID:', databaseId);
+  console.log('Table ID:', tableId);
+  
+  USERS_CONFIG.connectionId = connectionId;
+  USERS_CONFIG.databaseId = databaseId;
+  USERS_CONFIG.tableId = tableId;
+  
+  console.log('✅ Configuration updated successfully');
+}
+
+/**
+ * Helper function to get the current configuration
+ */
+export function getUsersDataConfig() {
+  return { ...USERS_CONFIG };
 } 

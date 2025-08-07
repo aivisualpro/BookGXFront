@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { 
   ArrowLeft,
   Settings,
@@ -21,7 +22,10 @@ import {
   loadHeaders,
   loadConnections,
   loadDatabases,
-  loadTables
+  loadTables,
+  saveSpreadsheetData,
+  loadSpreadsheetData,
+  deleteSpreadsheetData
 } from '../../lib/firebase';
 
 // Import optimization utilities
@@ -42,6 +46,7 @@ interface HeaderMapping {
   variableName: string;
   dataType: 'text' | 'number' | 'date' | 'boolean';
   isEnabled: boolean;
+  isKey: boolean; // New field to mark this as the primary key column
 }
 
 interface TableConnection {
@@ -96,15 +101,13 @@ interface HeadersManagerProps {
   selectedConnection: string;
   selectedDatabase: string;
   selectedTable: string;
-  activeTab: 'saudi' | 'egypt';
 }
 
 export function HeadersManager({ 
   setCurrentView, 
   selectedConnection, 
   selectedDatabase, 
-  selectedTable, 
-  activeTab 
+  selectedTable
 }: HeadersManagerProps) {
   // UI hooks
   const { toast } = useToast();
@@ -120,6 +123,18 @@ export function HeadersManager({
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // State for data synchronization
+  const [isSyncingData, setIsSyncingData] = useState(false);
+  const [dataStats, setDataStats] = useState<{
+    rowCount: number;
+    lastSync: Date | null;
+    hasData: boolean;
+  }>({
+    rowCount: 0,
+    lastSync: null,
+    hasData: false
+  });
 
   // Helper function to show detailed API access guidance
   const showApiAccessGuidance = () => {
@@ -187,6 +202,9 @@ export function HeadersManager({
           setHeaders(headersData);
           setEditingHeaders(headersData);
           
+          // Load data stats
+          await loadDataStats();
+          
           Logger.success(`Loaded ${headersData.length} headers successfully`);
           
         } catch (error) {
@@ -201,7 +219,7 @@ export function HeadersManager({
     };
 
     loadData();
-  }, [selectedConnection, selectedDatabase, selectedTable, activeTab]);
+  }, [selectedConnection, selectedDatabase, selectedTable]);
 
   // Helper to get current connection from Firebase
   const getCurrentConnection = async (): Promise<GoogleConnection | null> => {
@@ -213,7 +231,9 @@ export function HeadersManager({
         return sessionCache.get(cacheKey);
       }
       
-      const connections = await loadConnections(activeTab);
+      // Determine region from connection ID
+      const region = selectedConnection.startsWith('Saudi_') ? 'saudi' : 'egypt';
+      const connections = await loadConnections(region);
       const connection = connections.find(conn => conn.id === selectedConnection) || null;
       
       // Cache for 10 minutes
@@ -280,13 +300,35 @@ export function HeadersManager({
 
   // Header update functions
   const updateHeaderMapping = (headerId: string, field: keyof HeaderMapping, value: any) => {
-    const updatedHeaders = editingHeaders.map(header =>
-      header.id === headerId
-        ? { ...header, [field]: value }
-        : header
-    );
+    console.log('updateHeaderMapping called:', { headerId, field, value });
+    
+    setEditingHeaders(prevHeaders => {
+      console.log('Previous headers:', prevHeaders.map(h => ({ id: h.id, originalHeader: h.originalHeader })));
+      
+      const updatedHeaders = prevHeaders.map(header =>
+        header.id === headerId
+          ? { ...header, [field]: value }
+          : header
+      );
+      
+      console.log('Updated headers:', updatedHeaders.map(h => ({ id: h.id, originalHeader: h.originalHeader })));
+      return updatedHeaders;
+    });
+    
+    setHasUnsavedChanges(true);
+  };
+
+  // Set a header as the key (only one can be key at a time)
+  const setHeaderAsKey = (headerId: string) => {
+    const updatedHeaders = editingHeaders.map(header => ({
+      ...header,
+      isKey: header.id === headerId, // Only the selected header becomes the key
+      isEnabled: header.id === headerId ? true : header.isEnabled // Key headers must be enabled
+    }));
     setEditingHeaders(updatedHeaders);
     setHasUnsavedChanges(true);
+    
+    Logger.debug('Key header updated:', updatedHeaders.find(h => h.isKey)?.originalHeader);
   };
 
   // Save changes
@@ -299,8 +341,180 @@ export function HeadersManager({
       setHeaders(editingHeaders);
       setHasUnsavedChanges(false);
       Logger.success('Header mappings saved successfully');
+      
+      toast({
+        title: "Headers Saved",
+        description: "Header mappings have been saved successfully.",
+        variant: "default",
+      });
     } catch (error) {
       Logger.error('Error saving headers:', error);
+      toast({
+        title: "Save Failed",
+        description: "Failed to save header mappings. Please try again.",
+        variant: "destructive",
+      });
+    }
+  };
+
+  // Sync spreadsheet data to Firebase
+  const syncDataToFirebase = async () => {
+    if (!selectedConnectionData || !selectedDatabaseData || !selectedTableData) {
+      toast({
+        title: "Missing Data",
+        description: "Connection, database, or table information is missing.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    const enabledHeaders = editingHeaders.filter(h => h.isEnabled);
+    const keyHeader = editingHeaders.find(h => h.isKey);
+    
+    if (enabledHeaders.length === 0) {
+      toast({
+        title: "No Headers Selected",
+        description: "Please enable at least one header before syncing data.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    if (!keyHeader) {
+      toast({
+        title: "No Key Column Selected",
+        description: "Please select one header as the key column for unique document IDs.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    setIsSyncingData(true);
+    setError(null);
+
+    try {
+      Logger.debug('Starting data sync to Firebase...');
+      Logger.debug(`Using key column: ${keyHeader.originalHeader} (index: ${keyHeader.columnIndex})`);
+      
+      // First, check backend health
+      const { createBackendSheetsService } = await import('../../utils/backendSheetsService');
+      const backendService = createBackendSheetsService();
+      
+      const isBackendHealthy = await backendService.checkHealth();
+      if (!isBackendHealthy) {
+        throw new Error('Backend service is not available. Please check the server connection.');
+      }
+
+      // Test access to the spreadsheet
+      const hasAccess = await backendService.testAccess(
+        selectedDatabaseData.googleSheetId, 
+        selectedConnectionData
+      );
+      
+      if (!hasAccess) {
+        throw new Error('Cannot access the Google Spreadsheet. Please check your connection credentials.');
+      }
+
+      toast({
+        title: "Fetching Data",
+        description: "Retrieving data from Google Sheets...",
+        variant: "default",
+      });
+
+      // Fetch all data from the spreadsheet
+      const sheetData = await backendService.fetchSheetData(
+        selectedDatabaseData.googleSheetId,
+        selectedTableData.sheetName,
+        selectedConnectionData
+      );
+
+      if (!sheetData || sheetData.length === 0) {
+        throw new Error('No data found in the spreadsheet or the sheet is empty.');
+      }
+
+      // Remove the header row if it exists
+      const dataRows = sheetData.slice(1); // Skip first row (headers)
+      
+      Logger.debug(`Fetched ${dataRows.length} data rows from Google Sheets`);
+
+      toast({
+        title: "Clearing Old Data",
+        description: "Removing existing data to prevent duplicates...",
+        variant: "default",
+      });
+
+      // Clear existing data first to prevent duplicates
+      await deleteSpreadsheetData(
+        selectedConnection,
+        selectedDatabase,
+        selectedTable
+      );
+
+      Logger.debug('Cleared existing data from Firebase');
+
+      toast({
+        title: "Processing Data",
+        description: `Processing ${dataRows.length} rows with key column "${keyHeader.originalHeader}"...`,
+        variant: "default",
+      });
+
+      // Save data to Firebase with the key column as document ID
+      await saveSpreadsheetData(
+        selectedConnection,
+        selectedDatabase,
+        selectedTable,
+        dataRows,
+        editingHeaders
+      );
+
+      // Update local stats
+      setDataStats({
+        rowCount: dataRows.length,
+        lastSync: new Date(),
+        hasData: true
+      });
+
+      Logger.success(`Successfully synced ${dataRows.length} rows to Firebase`);
+
+      toast({
+        title: "Data Sync Complete",
+        description: `Successfully synced ${dataRows.length} rows using "${keyHeader.originalHeader}" as key column.`,
+        variant: "default",
+      });
+
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
+      Logger.error('Error syncing data to Firebase:', error);
+      setError(errorMessage);
+      
+      toast({
+        title: "Sync Failed",
+        description: errorMessage,
+        variant: "destructive",
+      });
+    } finally {
+      setIsSyncingData(false);
+    }
+  };
+
+  // Load existing data stats
+  const loadDataStats = async () => {
+    try {
+      const existingData = await loadSpreadsheetData(
+        selectedConnection,
+        selectedDatabase,
+        selectedTable
+      );
+      
+      if (existingData.length > 0) {
+        setDataStats({
+          rowCount: existingData.length,
+          lastSync: existingData[0]?.lastUpdated || null,
+          hasData: true
+        });
+      }
+    } catch (error) {
+      Logger.debug('No existing data found or error loading data stats');
     }
   };
 
@@ -454,7 +668,8 @@ export function HeadersManager({
           header
         ),
         dataType: 'text' as const,
-        isEnabled: true
+        isEnabled: true,
+        isKey: false // Default to false, user can select which one is the key
       }));
       
       Logger.success(`Generated ${headerMappings.length} default header mappings`);
@@ -528,10 +743,11 @@ export function HeadersManager({
       return;
     }
 
+    const newHeaderId = `header_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const newHeader: HeaderMapping = {
-      id: `header_${Date.now()}`,
+      id: newHeaderId,
       columnIndex: editingHeaders.length,
-      originalHeader: `Column ${editingHeaders.length + 1}`,
+      originalHeader: '', // Start with empty string so user can type immediately
       variableName: generateVariableName(
         selectedConnectionData.name,
         selectedDatabaseData.name,
@@ -539,11 +755,50 @@ export function HeadersManager({
         `Column ${editingHeaders.length + 1}`
       ),
       dataType: 'text',
-      isEnabled: true
+      isEnabled: true,
+      isKey: false
     };
 
-    setEditingHeaders([...editingHeaders, newHeader]);
+    console.log('Adding new header:', newHeader);
+    setEditingHeaders(prev => {
+      const updated = [...prev, newHeader];
+      console.log('Headers after adding new one:', updated.map(h => ({ id: h.id, originalHeader: h.originalHeader })));
+      return updated;
+    });
     setHasUnsavedChanges(true);
+    
+    // Focus the new header's input field after React has updated the DOM
+    requestAnimationFrame(() => {
+      setTimeout(() => {
+        const inputElement = document.querySelector(`input[data-header-id="${newHeaderId}"]`) as HTMLInputElement;
+        console.log('Looking for input with ID:', newHeaderId);
+        console.log('Found input element:', inputElement);
+        
+        if (inputElement) {
+          inputElement.focus();
+          inputElement.click(); // Trigger click to ensure cursor is positioned
+          console.log('Successfully focused new header input:', newHeaderId);
+          console.log('Input value:', inputElement.value);
+          console.log('Input readOnly:', inputElement.readOnly);
+          console.log('Input disabled:', inputElement.disabled);
+        } else {
+          console.warn('Could not find input element for new header:', newHeaderId);
+          console.log('Available inputs:', Array.from(document.querySelectorAll('input[data-header-id]')).map(el => el.getAttribute('data-header-id')));
+          
+          // Try again with a longer delay
+          setTimeout(() => {
+            const retryElement = document.querySelector(`input[data-header-id="${newHeaderId}"]`) as HTMLInputElement;
+            if (retryElement) {
+              retryElement.focus();
+              retryElement.click();
+              console.log('Successfully focused new header input on retry:', newHeaderId);
+            } else {
+              console.error('Still could not find input element:', newHeaderId);
+            }
+          }, 500);
+        }
+      }, 200);
+    });
   };
 
   // Remove header
@@ -588,6 +843,61 @@ export function HeadersManager({
 
   return (
     <div className="max-w-7xl mx-auto">
+      {/* Render action buttons in the breadcrumb area via portal */}
+      {typeof document !== 'undefined' && document.getElementById('action-buttons-container') && createPortal(
+        <div className="flex items-center space-x-2">
+          {hasUnsavedChanges && (
+            <div className="flex items-center space-x-1 mr-4">
+              <div className="w-1.5 h-1.5 bg-yellow-500 rounded-full animate-pulse"></div>
+              <span className="text-yellow-400 text-xs">Unsaved</span>
+            </div>
+          )}
+          <button
+            onClick={addNewHeader}
+            className="bg-green-600 hover:bg-green-700 text-white px-2.5 py-1.5 rounded-md transition-colors flex items-center space-x-1.5 text-xs"
+            title="Add new header"
+          >
+            <Plus className="w-3 h-3" />
+            <span className="hidden sm:inline">Add</span>
+          </button>
+          <button
+            onClick={refreshHeadersFromSheets}
+            className="bg-blue-600 hover:bg-blue-700 text-white px-2.5 py-1.5 rounded-md transition-colors flex items-center space-x-1.5 text-xs"
+            title="Refresh headers from Google Sheets"
+          >
+            <RefreshCw className="w-3 h-3" />
+            <span className="hidden sm:inline">Refresh</span>
+          </button>
+          <button
+            onClick={resetChanges}
+            className="bg-gray-600 hover:bg-gray-700 text-white px-2.5 py-1.5 rounded-md transition-colors flex items-center space-x-1.5 text-xs"
+          >
+            <RefreshCw className="w-3 h-3" />
+            <span className="hidden sm:inline">Reset</span>
+          </button>
+          <button
+            onClick={saveChanges}
+            className="bg-green-600 hover:bg-green-700 text-white px-2.5 py-1.5 rounded-md transition-colors flex items-center space-x-1.5 text-xs"
+          >
+            <Save className="w-3 h-3" />
+            <span className="hidden sm:inline">Save</span>
+          </button>
+          <button
+            onClick={syncDataToFirebase}
+            disabled={isSyncingData || editingHeaders.filter(h => h.isEnabled).length === 0}
+            className="bg-purple-600 hover:bg-purple-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white px-2.5 py-1.5 rounded-md transition-colors flex items-center space-x-1.5 text-xs"
+          >
+            {isSyncingData ? (
+              <RefreshCw className="w-3 h-3 animate-spin" />
+            ) : (
+              <Save className="w-3 h-3" />
+            )}
+            <span className="hidden sm:inline">{isSyncingData ? 'Syncing...' : 'Sync Data'}</span>
+          </button>
+        </div>,
+        document.getElementById('action-buttons-container')!
+      )}
+
       {/* Error Banner */}
       {error && (
         <div className="mb-6 bg-red-500/10 border border-red-500/20 rounded-lg p-4">
@@ -607,125 +917,36 @@ export function HeadersManager({
         </div>
       )}
 
-      {/* Breadcrumb */}
-      <div className="flex items-center space-x-4 mb-6">
-        <button
-          onClick={() => setCurrentView('connections')}
-          className="flex items-center space-x-2 text-gray-400 hover:text-white transition-colors"
-        >
-          <ArrowLeft className="w-4 h-4" />
-          <span>Back to Connections</span>
-        </button>
-        <div className="text-gray-400">/</div>
-        <button
-          onClick={() => setCurrentView('databases')}
-          className="text-gray-400 hover:text-white transition-colors"
-        >
-          {selectedConnectionData?.name || 'Unknown Connection'}
-        </button>
-        <div className="text-gray-400">/</div>
-        <button
-          onClick={() => setCurrentView('tables')}
-          className="text-gray-400 hover:text-white transition-colors"
-        >
-          {selectedDatabaseData?.name || 'Unknown Database'}
-        </button>
-        <div className="text-gray-400">/</div>
-        <div className="text-white font-medium">
-          {selectedTableData.name} - Headers
+      {/* Unsaved changes indicator */}
+      {hasUnsavedChanges && (
+        <div className="flex items-center space-x-1 mb-4">
+          <div className="w-1.5 h-1.5 bg-yellow-500 rounded-full animate-pulse"></div>
+          <span className="text-yellow-400 text-xs">You have unsaved changes</span>
         </div>
-      </div>
-
-      {/* Header */}
-      <div className="flex items-center justify-between mb-8">
-        <div>
-          <h1 className="text-3xl font-bold text-white mb-2">
-            Header Mapping - {selectedTableData.name}
-          </h1>
-          <p className="text-gray-400">Configure variable names and data types for your sheet headers</p>
-        </div>
-        <div className="flex items-center space-x-3">
-          {hasUnsavedChanges && (
-            <div className="flex items-center space-x-2">
-              <div className="w-2 h-2 bg-yellow-500 rounded-full animate-pulse"></div>
-              <span className="text-yellow-400 text-sm">Unsaved changes</span>
-            </div>
-          )}
-          <button
-            onClick={refreshHeadersFromSheets}
-            className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg transition-colors flex items-center space-x-2"
-            title="Refresh headers from Google Sheets"
-          >
-            <RefreshCw className="w-4 h-4" />
-            <span>Refresh from Sheets</span>
-          </button>
-          <button
-            onClick={resetChanges}
-            className="bg-gray-600 hover:bg-gray-700 text-white px-4 py-2 rounded-lg transition-colors flex items-center space-x-2"
-          >
-            <RefreshCw className="w-4 h-4" />
-            <span>Reset</span>
-          </button>
-          <button
-            onClick={saveChanges}
-            className="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg transition-colors flex items-center space-x-2"
-          >
-            <Save className="w-4 h-4" />
-            <span>Save Changes</span>
-          </button>
-        </div>
-      </div>
+      )}
 
       {/* Headers List */}
       <div className="bg-white/5 rounded-lg p-6">
-        <div className="flex items-center justify-between mb-6">
-          <h3 className="text-lg font-medium text-white">Header Mappings</h3>
-          {editingHeaders.length > 0 && (
-            <button
-              onClick={addNewHeader}
-              className="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg transition-colors flex items-center space-x-2 text-sm"
-            >
-              <Plus className="w-4 h-4" />
-              <span>Add Header</span>
-            </button>
-          )}
-        </div>
-        
         {editingHeaders.length === 0 ? (
           <div className="text-center py-12">
             <Settings className="w-16 h-16 text-gray-500 mx-auto mb-4" />
             <h3 className="text-lg font-medium text-white mb-2">No Headers Found</h3>
             <p className="text-gray-400 mb-6">
               This table doesn't have any headers configured yet. 
-              You can refresh headers from the connected Google Sheet or add them manually.
+              You can refresh headers from the connected Google Sheet or add them manually using the buttons above.
             </p>
-            <div className="flex flex-col sm:flex-row gap-4 justify-center">
-              <button
-                onClick={refreshHeadersFromSheets}
-                className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg transition-colors flex items-center space-x-2"
-              >
-                <RefreshCw className="w-5 h-5" />
-                <span>Load from Google Sheets</span>
-              </button>
-              <button
-                onClick={addNewHeader}
-                className="bg-green-600 hover:bg-green-700 text-white px-6 py-3 rounded-lg transition-colors flex items-center space-x-2"
-              >
-                <Plus className="w-5 h-5" />
-                <span>Add Header Manually</span>
-              </button>
-            </div>
           </div>
         ) : (
           <div>
             {/* Table Header */}
-            <div className="grid grid-cols-1 lg:grid-cols-7 gap-4 items-center mb-4 pb-4 border-b border-white/20">
-              <div className="text-sm text-gray-400 font-medium">Column</div>
-              <div className="text-sm text-gray-400 font-medium">Original Header</div>
-              <div className="lg:col-span-2 text-sm text-gray-400 font-medium">Variable Name</div>
-              <div className="text-sm text-gray-400 font-medium">Data Type</div>
-              <div className="text-sm text-gray-400 font-medium">Enabled</div>
-              <div className="text-sm text-gray-400 font-medium">Actions</div>
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-center mb-4 pb-4 border-b border-white/20">
+              <div className="lg:col-span-1 text-sm text-gray-400 font-medium">Column</div>
+              <div className="lg:col-span-2 text-sm text-gray-400 font-medium">Original Header</div>
+              <div className="lg:col-span-4 text-sm text-gray-400 font-medium">Variable Name</div>
+              <div className="lg:col-span-2 text-sm text-gray-400 font-medium">Data Type</div>
+              <div className="lg:col-span-1 text-sm text-gray-400 font-medium">Enabled</div>
+              <div className="lg:col-span-1 text-sm text-gray-400 font-medium">Key Column</div>
+              <div className="lg:col-span-1 text-sm text-gray-400 font-medium">Actions</div>
             </div>
             
             {/* Table Rows */}
@@ -735,27 +956,48 @@ export function HeadersManager({
                 .sort((a, b) => a.columnIndex - b.columnIndex)
                 .map((header) => (
                 <div key={header.id} className="bg-white/5 rounded-lg p-4">
-                  <div className="grid grid-cols-1 lg:grid-cols-7 gap-4 items-center">
+                  <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-center">
                     {/* Column Index */}
-                    <div>
+                    <div className="lg:col-span-1">
                       <div className="text-white font-medium">{header.columnIndex + 1}</div>
                     </div>
 
                     {/* Original Header */}
-                    <div>
+                    <div className="lg:col-span-2">
                       <input
                         type="text"
-                        value={header.originalHeader}
+                        value={header.originalHeader || ''}
+                        data-header-id={header.id}
                         onChange={(e) => {
-                          updateHeaderMapping(header.id, 'originalHeader', e.target.value);
-                          autoGenerateVariableName(header.id, e.target.value);
+                          const newValue = e.target.value;
+                          console.log('Input onChange triggered:', {
+                            headerId: header.id,
+                            oldValue: header.originalHeader,
+                            newValue: newValue,
+                            timestamp: new Date().toISOString()
+                          });
+                          
+                          updateHeaderMapping(header.id, 'originalHeader', newValue);
+                          autoGenerateVariableName(header.id, newValue);
                         }}
-                        className="w-full px-3 py-2 bg-white/10 border border-white/20 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+                        onFocus={(e) => {
+                          console.log('Input focused:', header.id, 'value:', e.target.value);
+                        }}
+                        onBlur={(e) => {
+                          console.log('Input blurred:', header.id, 'value:', e.target.value);
+                        }}
+                        onKeyDown={(e) => {
+                          console.log('Key pressed:', e.key, 'on header:', header.id, 'current value:', e.currentTarget.value);
+                        }}
+                        placeholder={!header.originalHeader ? 'Enter header name...' : ''}
+                        autoComplete="off"
+                        spellCheck={false}
+                        className="w-full px-3 py-2 bg-white/10 border border-white/20 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 placeholder-gray-400"
                       />
                     </div>
 
                     {/* Variable Name */}
-                    <div className="lg:col-span-2">
+                    <div className="lg:col-span-4">
                       <input
                         type="text"
                         value={header.variableName}
@@ -765,7 +1007,7 @@ export function HeadersManager({
                     </div>
 
                     {/* Data Type */}
-                    <div>
+                    <div className="lg:col-span-2">
                       <select
                         value={header.dataType}
                         onChange={(e) => updateHeaderMapping(header.id, 'dataType', e.target.value)}
@@ -779,21 +1021,41 @@ export function HeadersManager({
                     </div>
 
                     {/* Enabled Toggle */}
-                    <div>
+                    <div className="lg:col-span-1">
                       <button
                         onClick={() => updateHeaderMapping(header.id, 'isEnabled', !header.isEnabled)}
+                        disabled={header.isKey} // Key headers must stay enabled
                         className={`flex items-center justify-center w-10 h-10 rounded-lg transition-colors ${
                           header.isEnabled 
                             ? 'bg-green-600 hover:bg-green-700 text-white' 
                             : 'bg-gray-600 hover:bg-gray-700 text-gray-400'
-                        }`}
+                        } ${header.isKey ? 'opacity-50 cursor-not-allowed' : ''}`}
                       >
                         {header.isEnabled ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />}
                       </button>
                     </div>
 
+                    {/* Key Column Toggle */}
+                    <div className="lg:col-span-1">
+                      <button
+                        onClick={() => setHeaderAsKey(header.id)}
+                        className={`flex items-center justify-center w-10 h-10 rounded-lg transition-colors ${
+                          header.isKey 
+                            ? 'bg-yellow-600 hover:bg-yellow-700 text-white' 
+                            : 'bg-gray-600 hover:bg-gray-700 text-gray-400'
+                        }`}
+                        title={header.isKey ? 'This is the key column' : 'Set as key column'}
+                      >
+                        {header.isKey ? (
+                          <CheckCircle className="w-4 h-4" />
+                        ) : (
+                          <Settings className="w-4 h-4" />
+                        )}
+                      </button>
+                    </div>
+
                     {/* Remove Button */}
-                    <div>
+                    <div className="lg:col-span-1">
                       <button
                         onClick={() => removeHeader(header.id)}
                         className="flex items-center justify-center w-10 h-10 rounded-lg bg-red-600 hover:bg-red-700 text-white transition-colors"
@@ -811,7 +1073,7 @@ export function HeadersManager({
       </div>
 
       {/* Summary Stats */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mt-8">
+      <div className="grid grid-cols-1 md:grid-cols-5 gap-6 mt-8">
         <div className="bg-white/5 rounded-lg p-6 text-center">
           <div className="text-gray-400 text-sm mb-1">Total Headers</div>
           <div className="text-white font-medium">{editingHeaders.length}</div>
@@ -821,10 +1083,75 @@ export function HeadersManager({
           <div className="text-white font-medium">{editingHeaders.filter(h => h.isEnabled).length}</div>
         </div>
         <div className="bg-white/5 rounded-lg p-6 text-center">
-          <div className="text-gray-400 text-sm mb-1">Disabled Headers</div>
-          <div className="text-white font-medium">{editingHeaders.filter(h => !h.isEnabled).length}</div>
+          <div className="text-gray-400 text-sm mb-1">Key Column</div>
+          <div className="text-white font-medium text-xs">
+            {editingHeaders.find(h => h.isKey)?.originalHeader || 'Not Set'}
+          </div>
+        </div>
+        <div className="bg-white/5 rounded-lg p-6 text-center">
+          <div className="text-gray-400 text-sm mb-1">Data Rows in Firebase</div>
+          <div className="text-white font-medium">{dataStats.rowCount}</div>
+        </div>
+        <div className="bg-white/5 rounded-lg p-6 text-center">
+          <div className="text-gray-400 text-sm mb-1">Last Data Sync</div>
+          <div className="text-white font-medium text-xs">
+            {dataStats.lastSync ? 
+              dataStats.lastSync.toLocaleString() : 
+              'Never'
+            }
+          </div>
         </div>
       </div>
+
+      {/* Data Sync Status */}
+      {dataStats.hasData && (
+        <div className="mt-6 bg-green-500/10 border border-green-500/20 rounded-lg p-4">
+          <div className="flex items-center space-x-3">
+            <CheckCircle className="w-5 h-5 text-green-500" />
+            <div>
+              <span className="text-green-400 font-medium">Data Synchronized</span>
+              <p className="text-green-300 text-sm mt-1">
+                {dataStats.rowCount} rows of spreadsheet data are stored in Firebase with the current header configuration.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Sync Instructions */}
+      {editingHeaders.filter(h => h.isEnabled).length > 0 && !dataStats.hasData && (
+        <div className="mt-6 bg-blue-500/10 border border-blue-500/20 rounded-lg p-4">
+          <div className="flex items-center space-x-3">
+            <RefreshCw className="w-5 h-5 text-blue-500" />
+            <div>
+              <span className="text-blue-400 font-medium">Ready to Sync Data</span>
+              <p className="text-blue-300 text-sm mt-1">
+                You have {editingHeaders.filter(h => h.isEnabled).length} headers enabled. 
+                {editingHeaders.find(h => h.isKey) ? 
+                  ` Using "${editingHeaders.find(h => h.isKey)?.originalHeader}" as key column.` :
+                  ' Please select a key column first.'
+                } Click "Sync Data to Firebase" to import your Google Sheets data.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Key Column Instructions */}
+      {editingHeaders.length > 0 && !editingHeaders.find(h => h.isKey) && (
+        <div className="mt-6 bg-yellow-500/10 border border-yellow-500/20 rounded-lg p-4">
+          <div className="flex items-center space-x-3">
+            <Settings className="w-5 h-5 text-yellow-500" />
+            <div>
+              <span className="text-yellow-400 font-medium">Select Key Column</span>
+              <p className="text-yellow-300 text-sm mt-1">
+                Choose one header as the key column. This column's values will be used as unique Firebase document IDs, 
+                enabling proper data synchronization and updates. Common key columns include ID, Email, or Name.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Unsaved Changes Warning */}
       {hasUnsavedChanges && (
